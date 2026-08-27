@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -226,6 +227,59 @@ class StoreTest(unittest.TestCase):
         db.prune_old_buckets(self.conn, "C:", keep_snapshot_id=b.id)
         rows = list(self.conn.execute("SELECT DISTINCT snapshot_id FROM age_buckets"))
         self.assertEqual([r["snapshot_id"] for r in rows], [b.id])
+
+
+class ReclaimTest(unittest.TestCase):
+    """删过行之后,库文件要真的还给操作系统。
+
+    这个工具是用来省磁盘的,自己泄漏磁盘最说不过去。SQLite 删行只把页
+    挂到 freelist,文件大小一分不降,而降级/清理每次扫描都在删行。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "t.db"
+        self.conn = db.connect(self.path)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _fill_then_delete(self, rows: int = 4000) -> None:
+        """撑大库再删空,制造一堆 freelist 页。"""
+        snap = db.Snapshot(
+            drive="C:", taken_at=1000.0, method="mft",
+            total_bytes=1, free_bytes=1, used_bytes=0,
+        )
+        db.insert_snapshot(self.conn, snap)
+        db.insert_dirs(self.conn, snap.id, [
+            db.DirRow(f"Users\\alice\\{'deep' * 12}\\{i}", 3, i, i, 1, 0)
+            for i in range(rows)
+        ])
+        self.conn.execute("DELETE FROM dirs")
+
+    def test_maybe_vacuum_shrinks_file_after_deletes(self):
+        self._fill_then_delete()
+        before = self.path.stat().st_size
+        # 阈值显式传,别让这条测试依赖生产默认值
+        self.assertTrue(db.maybe_vacuum(self.conn, min_waste_bytes=0))
+        self.assertLess(self.path.stat().st_size, before)
+
+    def test_maybe_vacuum_declines_when_waste_is_small(self):
+        # 占比很高（~94%）但绝对值小（~1.2 MB）：只有绝对下限能拦住它。
+        # 用空库测是测不出来的，两道门都会拦。
+        self._fill_then_delete(rows=4000)
+        waste, total = db.wasted_bytes(self.conn)
+        self.assertGreater(waste / total, 0.2, "测例前提变了")
+        self.assertLess(waste, 8 * 1024 * 1024, "测例前提变了")
+        self.assertFalse(db.maybe_vacuum(self.conn))
+
+    def test_maybe_vacuum_respects_ratio_floor(self):
+        # 浪费绝对值够大但占比很小时，也不值得动
+        self._fill_then_delete()
+        self.assertFalse(
+            db.maybe_vacuum(self.conn, min_waste_bytes=0, min_waste_ratio=1.5)
+        )
 
 
 if __name__ == "__main__":

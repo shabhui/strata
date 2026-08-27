@@ -219,6 +219,14 @@ def scan_drive(
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    # 降级和清理每次扫描都在删行，而 SQLite 删行只把页挂到 freelist，文件不会缩。
+    # 一个用来省硬盘的工具自己泄漏硬盘最说不过去。
+    # 必须在 COMMIT 之后：VACUUM 不能出现在事务里。
+    try:
+        db.maybe_vacuum(conn)
+    except sqlite3.Error:
+        # 回收失败不该让一次已经成功的扫描变成失败。
+        pass
 
     return ScanResult(
         drive=drive,

@@ -451,6 +451,43 @@ def prune_snapshots(conn: sqlite3.Connection, drive: str, keep_daily: int = 120)
 
 def vacuum(conn: sqlite3.Connection) -> None:
     conn.execute("VACUUM")
+    # WAL 模式下 VACUUM 只是把重建写进 WAL，不 checkpoint 的话主库一字节不会缩。
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def wasted_bytes(conn: sqlite3.Connection) -> tuple[int, int]:
+    """返回 (freelist 字节, 库文件字节)。
+
+    SQLite 删行只把页挂到 freelist,文件大小一分不降。降级和清理每次扫描
+    都在删行,所以这个数只会往上走,除非 VACUUM。
+    """
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    return free * page_size, page_count * page_size
+
+
+def maybe_vacuum(
+    conn: sqlite3.Connection,
+    *,
+    min_waste_bytes: int = 8 * 1024 * 1024,
+    min_waste_ratio: float = 0.2,
+) -> bool:
+    """浪费得够多才 VACUUM,返回是否真的做了。
+
+    VACUUM 要整库重写(实测 26 MB 用 0.4 秒),每次扫描都做是白费 I/O;
+    一直不做,文件会稳定停在实际数据的两倍上下。所以设个阈值:既浪费超过
+    8 MB、又占到文件两成以上才动手。
+
+    必须在事务外调用 —— VACUUM 不能出现在事务里。
+    """
+    waste, total = wasted_bytes(conn)
+    if waste < min_waste_bytes or not total:
+        return False
+    if waste / total < min_waste_ratio:
+        return False
+    vacuum(conn)
+    return True
 
 
 def db_size_bytes(path: Path | str | None = None) -> int:
