@@ -260,7 +260,14 @@ def usn_daily_summary(
     for day, summary in out.items():
         if not summary.deleted:
             continue
-        start = time.mktime(time.strptime(day, "%Y-%m-%d"))
+        start = config.day_timestamp(day)
+        if start is None:
+            # 这一天算不出当地午夜就不查明细,而不是让它把整个结果带崩。
+            # 走 HTTP 打不到这里:上面的 cutoff 只放过 days 天内的事件,而
+            # days 被接口层夹在 3650。但 days 本身没有上界,函数对任何取值都
+            # 该成立 —— UTC+8 上时间戳 0 的事件会被归到 '1970-01-01',那天的
+            # 当地午夜在 epoch 之前,原来这行会抛 OverflowError。
+            continue
         end = start + 86400 + 7200      # 多给两小时,夏令时不会漏掉边缘事件
         summary.top_deleted = [
             {

@@ -102,6 +102,66 @@ class StoreTest(unittest.TestCase):
         kids = db.children_of(self.conn, snap.id, "50%_off")
         self.assertEqual([r["path"] for r in kids], ["50%_off\\real"])
 
+    def test_children_of_stops_at_the_separator_boundary(self):
+        r"""紧贴分隔符两侧码位的兄弟目录不能漏进来。
+
+        分隔符是 chr(92);它左右紧邻的是 chr(91) '[' 和 chr(93) ']'。用范围
+        查询取子目录时,上界正好落在 chr(93) 上,所以叫 `Users]` 的兄弟目录
+        是唯一有机会越界的名字 —— 差一个码位就会把它当成子目录。
+        """
+        snap = self._snap()
+        db.insert_dirs(
+            self.conn,
+            snap.id,
+            [
+                db.DirRow("Users", 1, 10, 10, 1, 0),
+                db.DirRow("Users[", 1, 11, 11, 1, 0),      # chr(91),下界外
+                db.DirRow("Users]", 1, 12, 12, 1, 0),      # chr(93),上界外
+                db.DirRow("Users\\real", 2, 9, 9, 1, 0),
+                db.DirRow("Users[\\nope", 2, 8, 8, 1, 0),
+                db.DirRow("Users]\\nope", 2, 7, 7, 1, 0),
+            ],
+        )
+        self.assertEqual(
+            [r["path"] for r in db.children_of(self.conn, snap.id, "Users")],
+            ["Users\\real"],
+        )
+        # 反过来也要对:从 Users] 看下去只能看到自己的孩子
+        self.assertEqual(
+            [r["path"] for r in db.children_of(self.conn, snap.id, "Users]")],
+            ["Users]\\nope"],
+        )
+
+    def test_separator_bounds_are_adjacent_code_points(self):
+        """取子目录的范围上界只有在这两个码位紧邻时才成立。
+
+        改动其中任何一个都会让 children_of 静默返回错误结果 —— 要么漏掉子目录,
+        要么把兄弟目录当成子目录。放一条断言在这里,免得以后有人"顺手"改。
+        """
+        self.assertEqual(ord(db.SEP_NEXT), ord(db.SEP) + 1)
+
+    def test_children_of_handles_non_ascii_names(self):
+        """中文名的子目录要能取到,中文名的兄弟目录不能漏进来。
+
+        UTF-8 下非 ASCII 字符首字节都 >= 0xC2,远大于分隔符 chr(92),按字节序
+        比较时会落在范围之外 —— 这正是兄弟目录被正确排除的原因。
+        """
+        snap = self._snap()
+        db.insert_dirs(
+            self.conn,
+            snap.id,
+            [
+                db.DirRow("下载", 1, 10, 10, 1, 0),
+                db.DirRow("下载备份", 1, 11, 11, 1, 0),
+                db.DirRow("下载\\安装包", 2, 9, 9, 1, 0),
+                db.DirRow("下载备份\\不该出现", 2, 8, 8, 1, 0),
+            ],
+        )
+        self.assertEqual(
+            [r["path"] for r in db.children_of(self.conn, snap.id, "下载")],
+            ["下载\\安装包"],
+        )
+
     def test_files_roundtrip(self):
         snap = self._snap()
         db.insert_files(
@@ -280,6 +340,72 @@ class ReclaimTest(unittest.TestCase):
         self.assertFalse(
             db.maybe_vacuum(self.conn, min_waste_bytes=0, min_waste_ratio=1.5)
         )
+
+
+class StatsTest(unittest.TestCase):
+    """没有统计信息,查询规划器只能瞎猜选择度,而它猜错的代价很大。
+
+    实测:根视图那条 `depth=1 ORDER BY bytes DESC LIMIT 200`,没统计信息时
+    115 ms,有统计信息时 0.07 ms —— 因为 depth=1 只有 28 行,规划器却以为
+    按 bytes 索引扫更划算,结果把六万条索引全走穿了。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _fill(self, rows: int = 300) -> None:
+        snap = db.Snapshot(
+            drive="C:", taken_at=1000.0, method="mft",
+            total_bytes=1, free_bytes=1, used_bytes=0,
+        )
+        db.insert_snapshot(self.conn, snap)
+        db.insert_dirs(self.conn, snap.id, [
+            db.DirRow(f"d{i}\\x", 2, i, i, 1, 0) for i in range(rows)
+        ])
+
+    def _stat_tables(self) -> set[str]:
+        return {
+            r[0]
+            for r in self.conn.execute("SELECT DISTINCT tbl FROM sqlite_stat1")
+        }
+
+    def test_refresh_stats_populates_sqlite_stat1(self):
+        self._fill()
+        db.refresh_stats(self.conn)
+        self.assertIn("dirs", self._stat_tables())
+
+    def _stat_rows(self) -> list[tuple]:
+        return sorted(
+            tuple(r) for r in self.conn.execute("SELECT tbl, idx, stat FROM sqlite_stat1")
+        )
+
+    def test_refresh_stats_is_idempotent(self):
+        self._fill()
+        db.refresh_stats(self.conn)
+        first = self._stat_rows()
+        db.refresh_stats(self.conn)
+        self.assertEqual(self._stat_rows(), first)
+
+    def test_refresh_stats_survives_empty_db(self):
+        # 全新库还没有任何数据,不能因此炸掉一次扫描
+        db.refresh_stats(self.conn)
+
+    def test_refresh_stats_updates_after_data_changes(self):
+        """统计信息必须跟着数据走,否则第二次扫描后规划器还在用旧的行数。"""
+        # dirs 是 WITHOUT ROWID,主键索引就是表本身,所以这行的 idx 等于表名,
+        # 不是 NULL
+        q = "SELECT stat FROM sqlite_stat1 WHERE tbl='dirs' AND idx='dirs'"
+        self._fill(rows=10)
+        db.refresh_stats(self.conn)
+        before = self.conn.execute(q).fetchone()["stat"]
+        self._fill(rows=400)
+        db.refresh_stats(self.conn)
+        self.assertNotEqual(before, self.conn.execute(q).fetchone()["stat"])
 
 
 if __name__ == "__main__":

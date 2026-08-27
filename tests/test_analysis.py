@@ -771,6 +771,40 @@ class HotspotsTest(AnalysisFixture):
         found = hotspots.cleanup_candidates(self.conn, sid, min_bytes=MB)
         self.assertEqual([h.path for h in found], [r"Windows\Temp"])
 
+    def test_cleanup_skips_deeply_nested(self) -> None:
+        """压制要认所有层级的祖先,不只是直接父目录。
+
+        判断"祖先是否已收录"是沿路径向上查集合做的,只走一层就会把孙子目录
+        重复算进来 —— 界面上同一份空间会被列两次。
+        """
+        sid = self.add_snapshot(
+            taken_at=ts_at(0),
+            scanned=900 * MB,
+            dirs={
+                r"Windows\Temp": 300 * MB,
+                r"Windows\Temp\a\b\c": 200 * MB,       # 隔了三层
+                r"Windows\Temp\a\b\c\d\e": 100 * MB,   # 隔了五层
+            },
+        )
+        found = hotspots.cleanup_candidates(self.conn, sid, min_bytes=MB)
+        self.assertEqual([h.path for h in found], [r"Windows\Temp"])
+
+    def test_cleanup_sibling_with_shared_prefix_not_suppressed(self) -> None:
+        """名字以已收录目录开头、但不是它后代的目录,不能被压掉。
+
+        压制只在分隔符边界上成立:Windows\\Temp 收录之后,Windows\\Temp2 是
+        兄弟不是后代。少了分隔符这一步就会把它一起吞掉。
+        """
+        sid = self.add_snapshot(
+            taken_at=ts_at(0),
+            scanned=500 * MB,
+            dirs={r"Windows\Temp": 300 * MB, r"Windows\Temp2": 200 * MB},
+        )
+        found = hotspots.cleanup_candidates(self.conn, sid, min_bytes=MB)
+        self.assertEqual(
+            sorted(h.path for h in found), [r"Windows\Temp", r"Windows\Temp2"]
+        )
+
     def test_recently_grown_filters_by_age(self) -> None:
         now = ts_at(0, hour=18)
         sid = self.add_snapshot(
@@ -830,6 +864,28 @@ class HotspotsTest(AnalysisFixture):
         self.assertEqual(profile["older"]["bytes"], 40 * MB)
         total = sum(b["bytes"] for b in profile.values())
         self.assertEqual(total, 100 * MB)
+
+    def test_age_profile_dates_anchor_at_noon(self) -> None:
+        """日期按当天正午折算年龄,不是午夜。
+
+        分桶只精确到天,折算成时间戳时必须选一个代表时刻。取正午的话,误差最多
+        半天且两边对称;取午夜就等于把每个日期都算老了不到一天,正好卡在分界上的
+        那天会被推进更旧的一档。这里让 now 落在正午,7 天前那天的年龄恰好是 7.0,
+        属于「一周内」;若改用午夜就变成 7.5 天,掉进「一月内」。
+        """
+        # now 固定在某天正午,不依赖跑测试的时刻
+        anchor = date.today()
+        now = datetime(anchor.year, anchor.month, anchor.day, 12, 0, 0).timestamp()
+        sid = self.add_snapshot(
+            taken_at=now,
+            scanned=50 * MB,
+            buckets=[(day_str(-7, base=now), "edge", 50 * MB, 5)],
+        )
+
+        profile = {b["key"]: b for b in hotspots.age_profile(self.conn, sid, now=now)}
+
+        self.assertEqual(profile["week"]["bytes"], 50 * MB)
+        self.assertEqual(profile["month"]["bytes"], 0)
 
     def test_age_profile_keys_stable(self) -> None:
         sid = self.add_snapshot(taken_at=time.time(), scanned=0)

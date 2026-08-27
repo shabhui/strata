@@ -115,6 +115,20 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "Strata"
     sys_version = ""
 
+    # BaseHTTPRequestHandler 默认走 HTTP/1.0,每个请求都要新建一次 TCP 连接,
+    # ThreadingHTTPServer 还要跟着新建一个线程。页面一次要发五个请求,握手的
+    # 开销和查询本身一个量级 —— 实测整页从 83~131 ms 降到 51~93 ms,五次取样
+    # 比值 1.34~2.19 倍。绝对值抖得厉害(本机噪声),但没有一次是复用更慢的。
+    #
+    # 开 keep-alive 的前提是每个响应都带准确的 Content-Length,否则客户端会一直
+    # 等下一个字节。所有响应都从 _send() 出去,那里必然写 Content-Length。
+    protocol_version = "HTTP/1.1"
+
+    # 有了 keep-alive,连接会一直挂着,而 socketserver 的线程是一个连接一个,
+    # 不设超时就等于每个开过页面的浏览器永久占一个线程。基类的 handle_one_request
+    # 捕获 socket.timeout 后会置 close_connection,超时的连接会被正常收走。
+    timeout = 30
+
     # ---- 基础设施 ----
     def log_message(self, fmt: str, *args) -> None:
         # 默认实现会把每个请求打到 stderr,轮询状态时刷屏
@@ -125,6 +139,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            # 决定了要关就得说出来。基类只在 send_error 里写这个头,光把
+            # close_connection 置上,客户端并不知道 —— 它会拿这条连接发下一个
+            # 请求,然后收到一个连接重置,而不是一个正常响应。
+            self.send_header("Connection", "close")
         # 本地工具,禁掉一切嵌入和嗅探
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -142,6 +161,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, status: int, message: str) -> None:
         self._json({"error": message, "status": status}, status=status)
+
+    def _reject_unread(self, status: int, message: str) -> None:
+        """在没读请求体的情况下拒掉请求,并关掉连接。
+
+        keep-alive 下这一步不能省。响应发完连接还留着,没读走的请求体就躺在
+        接收缓冲里,基类会把它的第一行当成下一个请求的起始行 —— 客户端只会看到
+        一个来路不明的 400。HTTP/1.0 时代连接随手就关了,所以从来没露出来过。
+
+        不选"先读干净再拒":体积超限的那条路径要读的正是我们刚判定读不起的东西。
+        """
+        self.close_connection = True
+        self._error(status, message)
 
     # ---- 路由 ----
     def do_GET(self) -> None:        # noqa: N802
@@ -186,17 +217,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
 
+        # 下面三条都在读请求体之前就返回,所以走 _reject_unread 关掉连接
         if not self._same_origin():
-            self._error(403, "拒绝跨站请求")
+            self._reject_unread(403, "拒绝跨站请求")
             return
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            self._error(400, "Content-Length 不是数字")
+            self._reject_unread(400, "Content-Length 不是数字")
             return
         if length < 0 or length > _MAX_BODY:
-            self._error(413, "请求体过大")
+            self._reject_unread(413, "请求体过大")
             return
         raw = self.rfile.read(length) if length else b""
         try:

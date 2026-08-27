@@ -484,6 +484,48 @@ class DailySummaryTest(ChangesFixture):
     def test_empty(self) -> None:
         self.assertEqual(changes.usn_daily_summary(self.conn, "C:"), [])
 
+    def test_epoch_timestamp_filtered_by_cutoff(self) -> None:
+        """默认窗口下,时间戳为 0 的事件在 SQL 那层就被 cutoff 挡掉了。"""
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=0.0, reason=0, kind="delete",
+                          is_dir=False, name="epoch", bytes=MB),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="normal", bytes=2 * MB),
+            ]
+        )
+        summaries = changes.usn_daily_summary(self.conn, "C:")
+
+        self.assertEqual([s.day for s in summaries], [day_str(-1)])
+        self.assertEqual(summaries[0].deleted_bytes_known, 2 * MB)
+
+    def test_survives_unrepresentable_day(self) -> None:
+        """窗口足够大时,算不出当地午夜的那天要跳过,不能连带整个结果一起崩。
+
+        UTC+8 上 safe_day(0.0) 得到 '1970-01-01',而这一天的当地午夜在 epoch
+        之前,mktime 表示不了。默认 30 天窗口下这条事件进不了循环(见上一个测例),
+        HTTP 层也把 days 夹在 3650 —— 所以这不是接口上活着的崩溃。但 days 本身
+        没有上界,这个函数对任何 days 都该成立:坏的那天只丢自己。
+        """
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=0.0, reason=0, kind="delete",
+                          is_dir=False, name="epoch", bytes=MB),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="normal", bytes=2 * MB),
+            ]
+        )
+
+        summaries = changes.usn_daily_summary(self.conn, "C:", days=3_000_000)
+
+        by_day = {s.day: s for s in summaries}
+        # 正常那天照常出现,明细也在
+        self.assertEqual(by_day[day_str(-1)].deleted_bytes_known, 2 * MB)
+        self.assertEqual(len(by_day[day_str(-1)].top_deleted), 1)
+        # 1970 那天计数还在,只是没有明细可查
+        self.assertEqual(by_day["1970-01-01"].deleted, 1)
+        self.assertEqual(by_day["1970-01-01"].top_deleted, [])
+
 
 class CoverageAndPruneTest(ChangesFixture):
     def test_coverage_empty(self) -> None:

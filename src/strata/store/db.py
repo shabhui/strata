@@ -14,6 +14,11 @@ from .. import config
 SCHEMA_PATH = config.schema_path()
 SCHEMA_VERSION = "1"
 
+# 路径分隔符和它紧邻的下一个码位。取子目录时用作范围上界:
+# 只有这两个码位相邻,[parent+SEP, parent+SEP_NEXT) 才恰好圈住 parent 的后代。
+SEP = "\\"          # chr(92)
+SEP_NEXT = "]"      # chr(93)
+
 
 @dataclass(slots=True)
 class Snapshot:
@@ -333,14 +338,23 @@ def children_of(
                 (snapshot_id, limit),
             )
         )
+    # 用范围而不是 LIKE:dirs 是 WITHOUT ROWID,二级索引会把主键列附在后面,
+    # 所以 idx_dirs_snap_depth 实际上就是 (snapshot_id, depth, path) —— 范围
+    # 谓词能直接 seek 到这棵子树。带 ESCAPE 的 LIKE 用不上这个,只能逐行取出来
+    # 试匹配再排序,实测 22 ms 对 0.03 ms。
+    #
+    # 上界取分隔符的下一个码位:落在 [parent+SEP, parent+SEP_NEXT) 里的路径,
+    # 紧跟 parent 的那个字符只可能是分隔符本身,所以圈中的正好是 parent 的后代,
+    # depth 再把它收窄到直接子目录。顺带也不用再转义 LIKE 元字符了。
     return list(
         conn.execute(
             """
             SELECT * FROM dirs
-             WHERE snapshot_id = ? AND depth = ? AND path LIKE ? ESCAPE '\\'
+             WHERE snapshot_id = ? AND depth = ?
+               AND path >= ? AND path < ?
              ORDER BY bytes DESC LIMIT ?
             """,
-            (snapshot_id, depth, _like_prefix(parent) + "%", limit),
+            (snapshot_id, depth, parent + SEP, parent + SEP_NEXT, limit),
         )
     )
 
@@ -351,10 +365,19 @@ def get_dir(conn: sqlite3.Connection, snapshot_id: int, path: str) -> sqlite3.Ro
     ).fetchone()
 
 
-def _like_prefix(parent: str) -> str:
-    """把目录路径转成 LIKE 前缀,转义 LIKE 元字符。"""
-    escaped = parent.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return escaped + "\\\\"
+def refresh_stats(conn: sqlite3.Connection) -> None:
+    """刷新查询规划器的统计信息。
+
+    没有 sqlite_stat1,规划器只能用内置的粗略估计去猜每个条件能筛掉多少行,
+    而它在这个库上猜得很偏。最典型的是根视图:`depth = 1` 只有 28 行,规划器
+    却认定按 bytes 索引扫更划算,于是为了凑满 LIMIT 200 把六万条索引全走穿 ——
+    115 ms。有统计信息之后同一条查询 0.07 ms。目录热点那条 `depth <= 6` 同理,
+    38.6 ms 降到 0.3 ms。
+
+    ANALYZE 在这个规模的库上 42 ms,不额外占空间,所以每次扫描完跟着跑一次,
+    让统计信息跟着数据走。必须在事务外调用。
+    """
+    conn.execute("ANALYZE")
 
 
 def prune_old_buckets(conn: sqlite3.Connection, drive: str, keep_snapshot_id: int) -> None:

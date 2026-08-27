@@ -9,6 +9,9 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from .. import config
+from ..store.db import SEP
+
 # 可清理候选:路径片段 → (标签, 说明, 安全等级)
 # 安全等级: 'safe' 删了只会丢缓存;'review' 可能有用,要看一眼;
 #           'careful' 删了可能影响功能
@@ -81,6 +84,27 @@ class GrowthSpot:
             "newest": self.newest,
             "days_old": self.days_old,
         }
+
+
+def _has_ancestor_in(path: str, found: set[str] | dict) -> bool:
+    """path 的某个祖先是否已经收录。
+
+    等价于 any(path.startswith(p + SEP) for p in found),但复杂度从"found 有
+    多大"变成"路径有多深" —— 前者每一对还要拼一次字符串。
+
+    收益别指望太大:2538 条真实路径固定拿 19 个 found 比,4.80 ms 降到 2.18 ms,
+    但真实循环里 found 是从空集长起来的,前面大部分行本来就没什么可比,整个接口
+    只快了 0.6 ms(15.3 → 14.7 ms)。留着是因为复杂度更好、代码也更短。
+
+    只在分隔符位置切,所以 Windows\\Temp 收录之后 Windows\\Temp2 不会被误判成
+    它的后代。
+    """
+    i = path.find(SEP)
+    while i != -1:
+        if path[:i] in found:
+            return True
+        i = path.find(SEP, i + 1)
+    return False
 
 
 def classify_path(path: str) -> tuple[str, str, str] | None:
@@ -235,7 +259,7 @@ def cleanup_candidates(
         if hint is None:
             continue
         # 命中同一规则的父目录已收录时跳过后代
-        if any(path.startswith(p + "\\") for p in found):
+        if _has_ancestor_in(path, found):
             continue
         found[path] = Hotspot(
             path=path,
@@ -259,7 +283,7 @@ def cleanup_candidates(
         hint = classify_path(path)
         if hint is None or path in found:
             continue
-        if any(path.startswith(p + "\\") for p in found):
+        if _has_ancestor_in(path, found):
             continue
         found[path] = Hotspot(
             path=path,
@@ -297,9 +321,10 @@ def age_profile(conn: sqlite3.Connection, snapshot_id: int, *, now: float | None
 
     totals = {key: [0, 0] for key, _, _ in bands}
     for row in rows:
-        try:
-            ts = time.mktime(time.strptime(row["day"] + " 12:00:00", "%Y-%m-%d %H:%M:%S"))
-        except ValueError:
+        # 取当天正午,而不是午夜:落在分界上的那天不会因为几小时的偏差被算到
+        # 相邻的年龄段里。这里一次请求要转上千个日期,strptime 太慢,见 config。
+        ts = config.day_timestamp(row["day"], 12)
+        if ts is None:
             continue
         age_days = (now - ts) / 86400
         for key, limit, _label in bands:

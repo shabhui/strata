@@ -116,6 +116,26 @@ def _walk_to_scan_entries(entries: list[walker.WalkEntry]) -> list[tree.ScanEntr
     ]
 
 
+def _post_scan_maintenance(conn: sqlite3.Connection) -> None:
+    """扫描落库之后的收尾。必须在事务外调用。
+
+    两件事都不影响数据正确性,只影响体积和速度,所以失败一律吞掉 —— 一次已经
+    成功的扫描不该因为收尾出错而变成失败。
+
+    1. 回收空间:降级和清理每次扫描都在删行,而 SQLite 删行只把页挂到 freelist,
+       文件不会缩。一个用来省硬盘的工具自己泄漏硬盘最说不过去。
+    2. 刷新统计信息:数据形状变了,规划器手里的旧行数会让它选错索引。实测根视图
+       那条查询没统计信息时 115 ms,有统计信息 0.07 ms。
+
+    VACUUM 和 ANALYZE 都不能出现在事务里。
+    """
+    for step in (db.maybe_vacuum, db.refresh_stats):
+        try:
+            step(conn)
+        except sqlite3.Error:
+            pass
+
+
 def collect_entries(
     drive: str,
     *,
@@ -219,14 +239,7 @@ def scan_drive(
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    # 降级和清理每次扫描都在删行，而 SQLite 删行只把页挂到 freelist，文件不会缩。
-    # 一个用来省硬盘的工具自己泄漏硬盘最说不过去。
-    # 必须在 COMMIT 之后：VACUUM 不能出现在事务里。
-    try:
-        db.maybe_vacuum(conn)
-    except sqlite3.Error:
-        # 回收失败不该让一次已经成功的扫描变成失败。
-        pass
+    _post_scan_maintenance(conn)
 
     return ScanResult(
         drive=drive,
@@ -296,6 +309,8 @@ def scan_directory(
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+    _post_scan_maintenance(conn)
 
     return ScanResult(
         drive=drive_label,

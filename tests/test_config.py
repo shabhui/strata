@@ -59,6 +59,87 @@ class SafeDayTest(unittest.TestCase):
                     self.fail(f"safe_day({value!r}) 抛了 {type(exc).__name__}: {exc}")
 
 
+class DayTimestampTest(unittest.TestCase):
+    """safe_day 的逆向:'YYYY-MM-DD' 还原成当地时间戳。
+
+    原来两处调用点直接用 time.strptime,它是纯 Python 实现,每次都要查 locale
+    再跑一次正则 —— 336 个日期 1.43 ms,换成切片取数字是 0.19 ms。更要紧的是
+    strptime 配 mktime 会抛 OverflowError,而 UTC+8 上 safe_day(0.0) 正好产出
+    '1970-01-01',当地午夜是 epoch 之前,mktime 表示不了,真把接口打崩过。
+    """
+
+    def test_matches_strptime_on_valid_dates(self):
+        """合法日期上必须和旧实现逐个一致,不然是在悄悄改数据。"""
+        checked = 0
+        for year in (1971, 1999, 2024, 2026, 2099):
+            for month in range(1, 13):
+                for day in (1, 15, 28):
+                    text = f"{year:04d}-{month:02d}-{day:02d}"
+                    for hour in (0, 12):
+                        stamp = f"{text} {hour:02d}:00:00"
+                        want = time.mktime(
+                            time.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+                        )
+                        with self.subTest(day=text, hour=hour):
+                            self.assertEqual(config.day_timestamp(text, hour), want)
+                        checked += 1
+        self.assertGreater(checked, 300, "测例前提变了")
+
+    def test_hour_offsets_from_midnight(self):
+        base = config.day_timestamp("2026-08-20", 0)
+        self.assertEqual(config.day_timestamp("2026-08-20", 12), base + 12 * 3600)
+
+    def test_round_trips_with_safe_day(self):
+        """safe_day 产出的每个字符串都必须能被还原回同一天。"""
+        for ts in (1e9, 1.5e9, 1.7e9, 2e9, 4e9):
+            day = config.safe_day(ts)
+            back = config.day_timestamp(day, 12)
+            self.assertIsNotNone(back, day)
+            self.assertEqual(config.safe_day(back), day)
+
+    def test_malformed_returns_none(self):
+        for text in ("", "2026", "2026-08", "2026-13-01", "2026-02-30",
+                     "2026-00-01", "2026-01-00", "2026-01-32", "2026/01/01",
+                     "abcd-ef-gh", "2026-08-28x", " 2026-08-28", "2026-8-1"):
+            with self.subTest(text=text):
+                self.assertIsNone(config.day_timestamp(text))
+
+    def test_rejects_what_int_would_tolerate(self):
+        """int() 认的东西不一定是合法日期,长度和分隔符查过了还不够。
+
+        int('+1') 是 1,int(' 999') 是 999 —— 少了纯数字这道校验,'2026-+1-01'
+        会被悄悄当成 1 月 1 日。宁可返回 None,不能猜。
+        """
+        for text in ("2026-+1-01", "2026-01-+1", "2026- 1-01", "2026-01- 1",
+                     "+999-01-01", " 999-01-01", "-999-01-01", "2026-01-1 "):
+            with self.subTest(text=text):
+                self.assertIsNone(config.day_timestamp(text))
+
+    def test_unrepresentable_day_returns_none_not_overflow(self):
+        """超出 mktime 表示范围的日期要返回 None,不能抛 OverflowError。
+
+        这正是打崩 usn_daily_summary 的那条路径。
+        """
+        self.assertIsNone(config.day_timestamp("1601-01-01"))
+
+    def test_never_raises(self):
+        for value in ("", "x", None, 0, 1.5, b"2026-08-28", object(), [], {},
+                      "9999-99-99", "1601-01-01", "1970-01-01"):
+            with self.subTest(value=repr(value)):
+                try:
+                    config.day_timestamp(value)
+                except Exception as exc:      # noqa: BLE001
+                    self.fail(
+                        f"day_timestamp({value!r}) 抛了 {type(exc).__name__}: {exc}"
+                    )
+
+    def test_repeated_calls_agree(self):
+        # 这个函数带缓存,缓存不能改变结果
+        first = config.day_timestamp("2026-08-20", 12)
+        for _ in range(3):
+            self.assertEqual(config.day_timestamp("2026-08-20", 12), first)
+
+
 class LegacyMigrationTest(unittest.TestCase):
     """改名(TimeClear -> Strata)之后老数据要能自己搬过来。
 

@@ -108,6 +108,42 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(row["drive"], "TEST")
         self.assertEqual(row["scanned_bytes"], sum(self.expected.values()))
 
+    def test_scan_refreshes_planner_stats(self):
+        """扫描完必须刷新统计信息,否则规划器会拿旧行数选错索引。
+
+        库里有没有 sqlite_stat1,决定根视图是 0.07 ms 还是 115 ms。
+        """
+        before = self.conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name='sqlite_stat1'"
+        ).fetchone()[0]
+        self.assertEqual(before, 0, "测例前提变了:新库不该已经有统计信息")
+
+        snapshot.scan_directory(self.conn, str(self.root), label="TEST")
+
+        self.assertGreater(
+            self.conn.execute(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl='dirs'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_scan_survives_broken_maintenance(self):
+        """收尾失败不能把一次已经成功的扫描变成失败。"""
+        import sqlite3 as _sqlite3
+
+        def boom(_conn):
+            raise _sqlite3.OperationalError("database is locked")
+
+        original = db.refresh_stats
+        db.refresh_stats = boom
+        try:
+            result = snapshot.scan_directory(self.conn, str(self.root), label="TEST")
+        finally:
+            db.refresh_stats = original
+
+        self.assertIsNotNone(result.snapshot_id)
+        self.assertEqual(db.get_snapshot(self.conn, result.snapshot_id)["complete"], 1)
+
     def test_dirs_table_has_correct_rollups(self):
         result = snapshot.scan_directory(self.conn, str(self.root), label="TEST")
         rows = {
