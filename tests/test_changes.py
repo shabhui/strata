@@ -1,0 +1,536 @@
+"""USN 收集层测试。
+
+真实卷读不了(要管理员权限),所以用假 journal 顶替 UsnJournal,
+把游标推进、日志重建、路径还原这些逻辑单独钉死。
+"""
+
+from __future__ import annotations
+
+import time
+import unittest
+from datetime import date, timedelta
+
+from strata.ntfs import usn as usn_mod
+from strata.scan import changes
+from strata.store import db
+
+MB = 1024 * 1024
+
+
+def ts_days_ago(n: float) -> float:
+    return time.time() - n * 86400
+
+
+def day_str(offset: int) -> str:
+    return (date.today() + timedelta(days=offset)).isoformat()
+
+
+def make_event(
+    *,
+    usn: int,
+    name: str,
+    reason: int,
+    parent: int = 5,
+    timestamp: float | None = None,
+    attributes: int = 0x80,
+) -> usn_mod.UsnEvent:
+    return usn_mod.UsnEvent(
+        usn=usn,
+        file_reference=usn + 1000,
+        parent_reference=parent,
+        timestamp=timestamp if timestamp is not None else ts_days_ago(1),
+        reason=reason,
+        attributes=attributes,
+        name=name,
+    )
+
+
+class FakeJournal:
+    """假的 UsnJournal。记录别人怎么调它,方便断言游标行为。"""
+
+    instances: list["FakeJournal"] = []
+
+    def __init__(self, drive: str) -> None:
+        self.drive = drive
+        self.last_usn = 0
+        self.read_from: list[int] = []
+        FakeJournal.instances.append(self)
+
+    # 由测试逐个设置
+    info = usn_mod.JournalInfo(
+        journal_id=111,
+        first_usn=0,
+        next_usn=9999,
+        lowest_valid_usn=0,
+        max_usn=1 << 60,
+        max_size=32 * MB,
+        allocation_delta=4 * MB,
+    )
+    events: list[usn_mod.UsnEvent] = []
+    raise_on_query: Exception | None = None
+
+    def query(self) -> usn_mod.JournalInfo:
+        if self.raise_on_query is not None:
+            raise self.raise_on_query
+        return self.info
+
+    def read_all(self, start_usn, *, journal_id=None, max_events=0, **kw):
+        self.read_from.append(start_usn)
+        picked = [e for e in self.events if e.usn >= start_usn]
+        for event in picked:
+            yield event
+        self.last_usn = (picked[-1].usn + 1) if picked else start_usn
+
+    def __enter__(self) -> "FakeJournal":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+class ChangesFixture(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        FakeJournal.instances = []
+        FakeJournal.events = []
+        FakeJournal.raise_on_query = None
+        FakeJournal.info = usn_mod.JournalInfo(
+            journal_id=111,
+            first_usn=0,
+            next_usn=9999,
+            lowest_valid_usn=0,
+            max_usn=1 << 60,
+            max_size=32 * MB,
+            allocation_delta=4 * MB,
+        )
+
+    def patch_journal(self) -> None:
+        original = changes.usn_mod.UsnJournal
+        changes.usn_mod.UsnJournal = FakeJournal
+        self.addCleanup(lambda: setattr(changes.usn_mod, "UsnJournal", original))
+
+    def add_event_rows(self, rows: list[db.UsnRow], drive: str = "C:") -> None:
+        db.insert_usn_events(self.conn, drive, rows)
+        self.conn.commit()
+
+
+class ComposePathTest(unittest.TestCase):
+    def test_uses_parent_map(self) -> None:
+        event = make_event(usn=1, name="big.iso", reason=usn_mod.USN_REASON_FILE_DELETE, parent=42)
+        path = changes._compose_path(event, {42: r"Users\me\Downloads"})
+        self.assertEqual(path, r"Users\me\Downloads\big.iso")
+
+    def test_root_parent_gives_bare_name(self) -> None:
+        event = make_event(usn=1, name="pagefile.sys", reason=0, parent=5)
+        self.assertEqual(changes._compose_path(event, {5: ""}), "pagefile.sys")
+
+    def test_unknown_parent_gives_none(self) -> None:
+        event = make_event(usn=1, name="x", reason=0, parent=999)
+        self.assertIsNone(changes._compose_path(event, {5: ""}))
+
+    def test_no_map_gives_none(self) -> None:
+        event = make_event(usn=1, name="x", reason=0)
+        self.assertIsNone(changes._compose_path(event, None))
+        self.assertIsNone(changes._compose_path(event, {}))
+
+
+class CollectUsnTest(ChangesFixture):
+    def test_stores_only_interesting_kinds(self) -> None:
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="new.bin", reason=usn_mod.USN_REASON_FILE_CREATE),
+            make_event(usn=11, name="gone.bin", reason=usn_mod.USN_REASON_FILE_DELETE),
+            make_event(usn=12, name="hot.log", reason=usn_mod.USN_REASON_DATA_EXTEND),
+            make_event(usn=13, name="acl", reason=usn_mod.USN_REASON_SECURITY_CHANGE),
+        ]
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertTrue(stats.available)
+        self.assertEqual(stats.events_read, 4)
+        self.assertEqual(stats.events_stored, 2)   # write 和 security 不入库
+
+        kinds = {r["kind"] for r in self.conn.execute("SELECT kind FROM usn_events")}
+        self.assertEqual(kinds, {"create", "delete"})
+
+    def test_resolves_paths_when_dir_map_given(self) -> None:
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="a.iso", reason=usn_mod.USN_REASON_FILE_DELETE, parent=7),
+            make_event(usn=11, name="b.iso", reason=usn_mod.USN_REASON_FILE_DELETE, parent=999),
+        ]
+        stats = changes.collect_usn(self.conn, "C:", dir_paths={7: r"Games\Steam"})
+
+        self.assertEqual(stats.resolved_paths, 1)
+        rows = {r["name"]: r["path"] for r in self.conn.execute("SELECT name, path FROM usn_events")}
+        self.assertEqual(rows["a.iso"], r"Games\Steam\a.iso")
+        self.assertIsNone(rows["b.iso"])
+
+    def test_first_run_is_not_a_reset(self) -> None:
+        """第一次跑没有历史可丢,不能报成「日志断了」。"""
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertTrue(stats.first_run)
+        self.assertFalse(stats.journal_reset)
+
+    def test_second_run_is_neither(self) -> None:
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        changes.collect_usn(self.conn, "C:")
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertFalse(stats.first_run)
+        self.assertFalse(stats.journal_reset)
+
+    def test_cursor_saved_and_reused(self) -> None:
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        changes.collect_usn(self.conn, "C:")
+
+        cursor = db.get_usn_cursor(self.conn, "C:")
+        self.assertEqual(cursor, (111, 11))
+
+        FakeJournal.events = [
+            make_event(usn=11, name="b", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        changes.collect_usn(self.conn, "C:")
+        # 第二次从上次结束的位置继续,不是从 0 重读
+        self.assertEqual(FakeJournal.instances[1].read_from, [11])
+
+    def test_journal_rebuild_resets_cursor(self) -> None:
+        self.patch_journal()
+        db.set_usn_cursor(self.conn, "C:", 111, 5000)
+        self.conn.commit()
+
+        FakeJournal.info = usn_mod.JournalInfo(
+            journal_id=222,       # 换了日志
+            first_usn=0,
+            next_usn=100,
+            lowest_valid_usn=0,
+            max_usn=1 << 60,
+            max_size=32 * MB,
+            allocation_delta=4 * MB,
+        )
+        FakeJournal.events = [
+            make_event(usn=1, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertTrue(stats.journal_reset)
+        self.assertFalse(stats.first_run)
+        self.assertEqual(FakeJournal.instances[0].read_from, [0])
+        self.assertEqual(db.get_usn_cursor(self.conn, "C:"), (222, 2))
+
+    def test_cursor_rolled_out_of_window(self) -> None:
+        """游标比日志最低有效值还旧,说明中间那段被覆盖了。"""
+        self.patch_journal()
+        db.set_usn_cursor(self.conn, "C:", 111, 100)
+        self.conn.commit()
+
+        FakeJournal.info = usn_mod.JournalInfo(
+            journal_id=111,
+            first_usn=8000,
+            next_usn=9000,
+            lowest_valid_usn=8000,
+            max_usn=1 << 60,
+            max_size=32 * MB,
+            allocation_delta=4 * MB,
+        )
+        FakeJournal.events = [
+            make_event(usn=8500, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        ]
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertTrue(stats.journal_reset)
+        self.assertEqual(FakeJournal.instances[0].read_from, [8000])
+
+    def test_journal_unavailable_is_reported_not_raised(self) -> None:
+        self.patch_journal()
+        FakeJournal.raise_on_query = usn_mod.JournalUnavailable("C: 没有启用 USN 日志。")
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertFalse(stats.available)
+        self.assertIn("USN", stats.reason)
+        self.assertEqual(stats.events_stored, 0)
+
+    def test_access_denied_is_reported_not_raised(self) -> None:
+        from strata.ntfs.volume import AccessDenied
+
+        self.patch_journal()
+        FakeJournal.raise_on_query = AccessDenied("需要管理员权限")
+        stats = changes.collect_usn(self.conn, "C:")
+
+        self.assertFalse(stats.available)
+        self.assertIn("管理员", stats.reason)
+
+    def test_duplicate_usn_not_inserted_twice(self) -> None:
+        self.patch_journal()
+        event = make_event(usn=10, name="a", reason=usn_mod.USN_REASON_FILE_CREATE)
+        FakeJournal.events = [event]
+        changes.collect_usn(self.conn, "C:")
+
+        # 游标倒回去重读同一条
+        db.set_usn_cursor(self.conn, "C:", 111, 0)
+        self.conn.commit()
+        changes.collect_usn(self.conn, "C:")
+
+        n = self.conn.execute("SELECT COUNT(*) c FROM usn_events").fetchone()["c"]
+        self.assertEqual(n, 1)
+
+
+class EnrichTest(ChangesFixture):
+    def _snapshot_with_file(self, path: str, size: int, taken_at: float) -> int:
+        sid = db.insert_snapshot(
+            self.conn,
+            db.Snapshot(
+                drive="C:",
+                taken_at=taken_at,
+                method="mft",
+                total_bytes=100 * MB,
+                free_bytes=10 * MB,
+                used_bytes=50 * MB,
+                scanned_bytes=50 * MB,
+            ),
+        )
+        db.insert_files(self.conn, sid, [db.FileRow(path=path, bytes=size)])
+        self.conn.commit()
+        return sid
+
+    def test_fills_size_from_snapshot(self) -> None:
+        self._snapshot_with_file(r"Downloads\big.iso", 700 * MB, ts_days_ago(3))
+        self.add_event_rows(
+            [
+                db.UsnRow(
+                    usn=1,
+                    timestamp=ts_days_ago(1),
+                    reason=usn_mod.USN_REASON_FILE_DELETE,
+                    kind="delete",
+                    is_dir=False,
+                    name="big.iso",
+                    path=r"Downloads\big.iso",
+                )
+            ]
+        )
+        filled = changes.enrich_deleted_sizes(self.conn, "C:")
+
+        self.assertEqual(filled, 1)
+        row = self.conn.execute("SELECT bytes FROM usn_events").fetchone()
+        self.assertEqual(row["bytes"], 700 * MB)
+
+    def test_prefers_newest_snapshot(self) -> None:
+        self._snapshot_with_file(r"a\x.bin", 100 * MB, ts_days_ago(9))
+        self._snapshot_with_file(r"a\x.bin", 300 * MB, ts_days_ago(2))
+        self.add_event_rows(
+            [
+                db.UsnRow(
+                    usn=1,
+                    timestamp=ts_days_ago(1),
+                    reason=usn_mod.USN_REASON_FILE_DELETE,
+                    kind="delete",
+                    is_dir=False,
+                    name="x.bin",
+                    path=r"a\x.bin",
+                )
+            ]
+        )
+        changes.enrich_deleted_sizes(self.conn, "C:")
+        self.assertEqual(
+            self.conn.execute("SELECT bytes FROM usn_events").fetchone()["bytes"],
+            300 * MB,
+        )
+
+    def test_unmatched_stays_null(self) -> None:
+        """快照里没见过的文件宁可留空,也不要瞎猜一个大小。"""
+        self._snapshot_with_file(r"a\known.bin", 100 * MB, ts_days_ago(2))
+        self.add_event_rows(
+            [
+                db.UsnRow(
+                    usn=1,
+                    timestamp=ts_days_ago(1),
+                    reason=usn_mod.USN_REASON_FILE_DELETE,
+                    kind="delete",
+                    is_dir=False,
+                    name="ghost.bin",
+                    path=r"a\ghost.bin",
+                )
+            ]
+        )
+        filled = changes.enrich_deleted_sizes(self.conn, "C:")
+
+        self.assertEqual(filled, 0)
+        self.assertIsNone(self.conn.execute("SELECT bytes FROM usn_events").fetchone()["bytes"])
+
+    def test_ignores_creates_and_dirs(self) -> None:
+        self._snapshot_with_file(r"a\x.bin", 100 * MB, ts_days_ago(2))
+        self.add_event_rows(
+            [
+                db.UsnRow(
+                    usn=1, timestamp=ts_days_ago(1), reason=0, kind="create",
+                    is_dir=False, name="x.bin", path=r"a\x.bin",
+                ),
+                db.UsnRow(
+                    usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                    is_dir=True, name="x.bin", path=r"a\x.bin",
+                ),
+            ]
+        )
+        self.assertEqual(changes.enrich_deleted_sizes(self.conn, "C:"), 0)
+
+
+class DailySummaryTest(ChangesFixture):
+    def test_counts_by_kind_per_day(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(1), reason=0, kind="create",
+                          is_dir=False, name="a"),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="create",
+                          is_dir=False, name="b"),
+                db.UsnRow(usn=3, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="c", bytes=50 * MB),
+                db.UsnRow(usn=4, timestamp=ts_days_ago(2), reason=0, kind="rename_old",
+                          is_dir=False, name="d"),
+            ]
+        )
+        summaries = {s.day: s for s in changes.usn_daily_summary(self.conn, "C:")}
+
+        yesterday = summaries[day_str(-1)]
+        self.assertEqual(yesterday.created, 2)
+        self.assertEqual(yesterday.deleted, 1)
+        self.assertEqual(yesterday.deleted_bytes_known, 50 * MB)
+        self.assertEqual(summaries[day_str(-2)].renamed, 1)
+
+    def test_unknown_sizes_counted_separately(self) -> None:
+        """有多少删除算不出大小,必须如实说,不能混进已知字节里。"""
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="known", bytes=10 * MB),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="unknown1"),
+                db.UsnRow(usn=3, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="unknown2"),
+            ]
+        )
+        s = changes.usn_daily_summary(self.conn, "C:")[0]
+
+        self.assertEqual(s.deleted, 3)
+        self.assertEqual(s.deleted_bytes_known, 10 * MB)
+        self.assertEqual(s.deleted_bytes_unknown_files, 2)
+
+    def test_top_deleted_ranked(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="small", path="a\\small", bytes=MB),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="huge", path="a\\huge", bytes=900 * MB),
+            ]
+        )
+        s = changes.usn_daily_summary(self.conn, "C:", top_n=2)[0]
+
+        self.assertEqual([d["path"] for d in s.top_deleted], ["a\\huge", "a\\small"])
+
+    def test_top_deleted_falls_back_to_name(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="orphan.bin", path=None, bytes=5 * MB),
+            ]
+        )
+        s = changes.usn_daily_summary(self.conn, "C:")[0]
+        self.assertEqual(s.top_deleted[0]["path"], "orphan.bin")
+
+    def test_cutoff_excludes_old(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(100), reason=0, kind="delete",
+                          is_dir=False, name="ancient"),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                          is_dir=False, name="recent"),
+            ]
+        )
+        days = [s.day for s in changes.usn_daily_summary(self.conn, "C:", days=30)]
+
+        self.assertEqual(days, [day_str(-1)])
+
+    def test_sorted_ascending(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=i, timestamp=ts_days_ago(i), reason=0, kind="create",
+                          is_dir=False, name=f"f{i}")
+                for i in (1, 5, 3)
+            ]
+        )
+        days = [s.day for s in changes.usn_daily_summary(self.conn, "C:")]
+        self.assertEqual(days, sorted(days))
+
+    def test_other_drive_excluded(self) -> None:
+        self.add_event_rows(
+            [db.UsnRow(usn=1, timestamp=ts_days_ago(1), reason=0, kind="delete",
+                       is_dir=False, name="d-only")],
+            drive="D:",
+        )
+        self.assertEqual(changes.usn_daily_summary(self.conn, "C:"), [])
+        self.assertEqual(len(changes.usn_daily_summary(self.conn, "D:")), 1)
+
+    def test_empty(self) -> None:
+        self.assertEqual(changes.usn_daily_summary(self.conn, "C:"), [])
+
+
+class CoverageAndPruneTest(ChangesFixture):
+    def test_coverage_empty(self) -> None:
+        cov = changes.usn_coverage(self.conn, "C:")
+        self.assertEqual(cov, {"events": 0, "first_day": None, "last_day": None, "days": 0})
+
+    def test_coverage_span(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(6), reason=0, kind="create",
+                          is_dir=False, name="a"),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(0), reason=0, kind="create",
+                          is_dir=False, name="b"),
+            ]
+        )
+        cov = changes.usn_coverage(self.conn, "C:")
+
+        self.assertEqual(cov["events"], 2)
+        self.assertEqual(cov["first_day"], day_str(-6))
+        self.assertEqual(cov["last_day"], day_str(0))
+        self.assertEqual(cov["days"], 7)
+
+    def test_prune_removes_old_only(self) -> None:
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(300), reason=0, kind="create",
+                          is_dir=False, name="old"),
+                db.UsnRow(usn=2, timestamp=ts_days_ago(10), reason=0, kind="create",
+                          is_dir=False, name="new"),
+            ]
+        )
+        removed = changes.prune_usn_events(self.conn, "C:", keep_days=180)
+
+        self.assertEqual(removed, 1)
+        names = [r["name"] for r in self.conn.execute("SELECT name FROM usn_events")]
+        self.assertEqual(names, ["new"])
+
+    def test_prune_scoped_to_drive(self) -> None:
+        old = db.UsnRow(usn=1, timestamp=ts_days_ago(300), reason=0, kind="create",
+                        is_dir=False, name="old")
+        self.add_event_rows([old], drive="C:")
+        self.add_event_rows([old], drive="D:")
+
+        changes.prune_usn_events(self.conn, "C:", keep_days=180)
+        rows = list(self.conn.execute("SELECT drive FROM usn_events"))
+        self.assertEqual([r["drive"] for r in rows], ["D:"])
+
+
+if __name__ == "__main__":
+    unittest.main()

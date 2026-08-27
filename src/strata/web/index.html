@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata — 空间是什么时候被吃掉的</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      Strata
+      <small>面积是大小,颜色是年龄</small>
+    </div>
+    <nav class="drive-tabs" id="driveTabs" role="tablist" aria-label="选择磁盘"></nav>
+    <div class="topbar-actions">
+      <div class="scan-state" id="scanState" hidden></div>
+      <button class="btn btn-primary" id="scanBtn">扫描本盘</button>
+    </div>
+  </div>
+  <div class="baseline" id="baseline">
+    <span class="dim">读取中……</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="banner" id="banner" hidden></div>
+
+  <div id="firstRun" hidden>
+    <div class="notice">
+      <b>还没有扫描过。</b>
+      点右上角「扫描本盘」跑一次,几十秒就好。第一次扫完就能看到过去几个月的
+      变化 —— 靠的是现存文件的创建日期倒推,不用等着攒数据。
+    </div>
+  </div>
+
+  <!-- 时间轴:这个工具的主张 -->
+  <section class="section" id="timelineSection">
+    <div class="section-head">
+      <h2>每日增减</h2>
+      <p>往右是今天。柱子朝上是增,朝下是减。</p>
+      <div class="right" id="timelineTotals"></div>
+    </div>
+    <div id="timelineNotice"></div>
+    <div class="empty-note" id="tlEmpty" hidden>还没有数据。扫一次就有了。</div>
+    <div class="tl-zoom" id="tlZoom" hidden>
+      <div class="tl-zoom-group" role="group" aria-label="缩放">
+        <button type="button" class="btn icon" id="tlZoomOut" title="缩小(-)" aria-label="缩小">−</button>
+        <button type="button" class="btn icon" id="tlZoomIn" title="放大(+)" aria-label="放大">+</button>
+        <button type="button" class="btn icon" id="tlReset" title="看全部(0)" aria-label="看全部">⤢</button>
+      </div>
+      <div class="tl-zoom-group" role="group" aria-label="平移">
+        <button type="button" class="btn icon" id="tlLeft" title="往左(←)" aria-label="往左">‹</button>
+        <button type="button" class="btn icon" id="tlRight" title="往右(→)" aria-label="往右">›</button>
+      </div>
+      <div class="tl-zoom-group" role="group" aria-label="最近">
+        <button type="button" class="btn tiny" data-span="7">7 天</button>
+        <button type="button" class="btn tiny" data-span="14">14 天</button>
+        <button type="button" class="btn tiny" data-span="30">30 天</button>
+      </div>
+      <button type="button" class="btn tiny" id="tlLog" aria-pressed="false"
+              title="纵轴取对数。大小差一百倍的日子就都看得见了(L)">对数纵轴</button>
+      <span class="tl-range" id="tlRange" aria-live="polite"></span>
+      <span class="tl-hint">Ctrl + 滚轮缩放,按住拖动平移</span>
+    </div>
+    <div class="timeline-shell" id="tlShell" tabindex="0"
+         aria-label="每日空间增减时间轴,方向键平移,加号减号缩放,0 看全部">
+      <svg id="timeline" role="img" aria-label="每日空间增减时间轴"></svg>
+      <div class="tip" id="tlTip" role="tooltip"></div>
+    </div>
+    <p class="basis-note">
+      <span><i class="basis-swatch hatched"></i>回溯值:按现存文件的创建日推算,看不到已经删掉的东西,是净增的下界。</span>
+      <span><i class="basis-swatch solid"></i>实测值:两次扫描的差,含删除,是真实净增减。</span>
+    </p>
+  </section>
+
+  <!-- 地层树图 -->
+  <section class="section">
+    <div class="section-head">
+      <h2>地层树图</h2>
+      <p>块的大小是占用,颜色是这一块里最新写入的时间。点色带只看某个年龄段。</p>
+      <div class="right" id="treemapTotals"></div>
+    </div>
+    <div class="legend" id="ageLegend" role="group" aria-label="按年龄筛选"></div>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="treemap-shell">
+      <canvas id="treemap" height="440" role="img" aria-label="按大小和年龄排布的目录树图"></canvas>
+      <div class="tip" id="tmTip" role="tooltip"></div>
+    </div>
+  </section>
+
+  <!-- 消失了什么 -->
+  <section class="section" id="deletedSection" hidden>
+    <div class="section-head">
+      <h2>消失了什么</h2>
+      <p>从 NTFS 变更日志里读出来的删除记录。时间戳看不到这些。</p>
+      <div class="right" id="usnCoverage"></div>
+    </div>
+    <div id="usnNotice"></div>
+    <table class="grid">
+      <thead>
+        <tr>
+          <th>路径</th>
+          <th style="width:110px">大小</th>
+          <th style="width:150px">时间</th>
+        </tr>
+      </thead>
+      <tbody id="deletedBody"></tbody>
+    </table>
+  </section>
+
+  <!-- 两次扫描之间 -->
+  <section class="section" id="diffSection" hidden>
+    <div class="section-head">
+      <h2>最近两次扫描之间</h2>
+      <p id="diffRange"></p>
+      <div class="right" id="diffNet"></div>
+    </div>
+    <div id="diffNotice"></div>
+    <div class="cols">
+      <div>
+        <table class="grid">
+          <thead><tr><th>长大了</th><th style="width:130px">变化</th></tr></thead>
+          <tbody id="grewBody"></tbody>
+        </table>
+      </div>
+      <div>
+        <table class="grid">
+          <thead><tr><th>缩小了</th><th style="width:130px">变化</th></tr></thead>
+          <tbody id="shrankBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 大户与可清理 -->
+  <section class="section">
+    <div class="section-head">
+      <h2>空间大户</h2>
+      <p>排除了父子重复,同一份空间只算一次。</p>
+    </div>
+    <div class="cols">
+      <div>
+        <table class="grid">
+          <thead>
+            <tr><th>目录</th><th style="width:100px">占用</th><th style="width:96px">最近写入</th></tr>
+          </thead>
+          <tbody id="bigDirsBody"></tbody>
+        </table>
+      </div>
+      <div>
+        <table class="grid">
+          <thead>
+            <tr><th>最近在长的</th><th style="width:100px">占用</th><th style="width:96px">最近写入</th></tr>
+          </thead>
+          <tbody id="recentBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <h2>可以清的</h2>
+      <p>只标出来,不动手。删不删由你决定。</p>
+      <div class="right" id="cleanupTotal"></div>
+    </div>
+    <div class="notice">
+      <b>安全等级</b>:<span class="tag safe">可删</span> 缓存类,删了会自动重建。
+      <span class="tag review">先看看</span> 可能有你要的东西。
+      <span class="tag careful">当心</span> 影响系统或软件功能,别手删。
+    </div>
+    <table class="grid">
+      <thead>
+        <tr>
+          <th>路径</th>
+          <th style="width:120px">类型</th>
+          <th style="width:100px">占用</th>
+          <th style="width:78px">等级</th>
+        </tr>
+      </thead>
+      <tbody id="cleanupBody"></tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <h2>设置</h2>
+      <p>快照存在本机,不联网。</p>
+    </div>
+    <div class="notice" id="settingsInfo"></div>
+    <button class="toggle" id="scheduleToggle" aria-pressed="false">
+      <span class="toggle-track"><span class="toggle-knob"></span></span>
+      <span id="scheduleLabel">每天自动拍一次快照</span>
+    </button>
+    <p class="basis-note" id="scheduleDetail"></p>
+  </section>
+
+</main>
+
+<!-- 右键菜单。放在 main 外面,免得被各个 shell 的 overflow 裁掉 -->
+<div class="ctx" id="ctxMenu" role="menu" hidden>
+  <div class="ctx-path" id="ctxPath"></div>
+  <button type="button" class="ctx-item" role="menuitem" data-act="open">
+    在资源管理器打开
+  </button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="parent">
+    打开上一级目录
+  </button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="copy">
+    复制完整路径
+  </button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="enter">
+    在树图里进入这一层
+  </button>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

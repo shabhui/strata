@@ -1,0 +1,337 @@
+"""验证打包产物:跑一遍冻结后的代码路径。
+
+为什么要单独一个脚本:发布用的 exe 里写了 requireAdministrator,从普通
+命令行根本起不来(Permission denied),所以没法直接自动化验它。
+manifest 和「冻结后的 Python 代码能不能跑」是两件独立的事 —— 这里用同一份
+配置、只去掉 UAC 要求,打一个临时 exe 出来验后者。
+
+manifest 本身另外验(读发布 exe 里嵌的资源,见下面 check_manifest)。
+
+验的是那些只有冻结之后才会暴露的问题:
+  - web/ 有没有被打进去,config.web_dir() 在 _MEIPASS 里能不能找到
+  - 那些运行时才 import 的模块有没有漏
+  - 数据库路径有没有跟着跑到临时目录里去(必须还在 %LOCALAPPDATA%)
+  - 服务能不能起来、能不能把界面发出去
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RELEASE_EXE = ROOT / "dist" / "Strata.exe"
+PORT = 8765                     # 避开默认 8731 和预览用的 8732
+
+
+def log(msg: str) -> None:
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+def check_manifest() -> bool:
+    """发布 exe 里该有的两样东西:强制提权、长路径。"""
+    log("\n[1/5] 发布 exe 的 manifest")
+    if not RELEASE_EXE.exists():
+        log(f"  跳过:{RELEASE_EXE} 不在,先跑 tools/build_exe.py")
+        return False
+    try:
+        from PyInstaller.utils.win32 import winmanifest
+        raw = winmanifest.read_manifest_from_executable(str(RELEASE_EXE))
+    except Exception as exc:                          # noqa: BLE001
+        log(f"  读不出来:{type(exc).__name__}: {exc}")
+        return False
+
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    ok = True
+    for probe, why in (("requireAdministrator", "双击就提权"),
+                       ("longPathAware", "超过 260 字符的路径")):
+        good = probe in text
+        ok &= good
+        log(f"  {'OK ' if good else 'BAD'} {probe}({why})")
+    return ok
+
+
+def build_test_exe(workdir: Path) -> Path | None:
+    """用发布配置打一个不要求提权的副本,只为了能在普通权限下跑。"""
+    log("\n[2/5] 打一个不提权的副本用来验代码路径")
+    spec_src = (ROOT / "tools" / "strata.spec").read_text(encoding="utf-8")
+    # 只动这两处:去掉 UAC 要求和自定义 manifest,其余(datas、hiddenimports、
+    # excludes)和发布配置完全一致,不然验的就不是同一个东西了。
+    spec = (spec_src
+            .replace("uac_admin=True", "uac_admin=False")
+            .replace('manifest=str(ROOT / "tools" / "strata.manifest"),', "")
+            .replace('name="Strata"', 'name="StrataNoUAC"'))
+    spec_path = workdir / "strata_nouac.spec"
+    # spec 里用 SPECPATH 推 ROOT,所以它必须待在 tools/ 的位置上
+    spec_path = ROOT / "tools" / "_verify_nouac.spec"
+    spec_path.write_text(spec, encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "PyInstaller", str(spec_path), "--noconfirm",
+             "--distpath", str(workdir / "dist"), "--workpath", str(workdir / "build"),
+             "--log-level", "WARN"],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    finally:
+        spec_path.unlink(missing_ok=True)
+
+    exe = workdir / "dist" / "StrataNoUAC.exe"
+    if proc.returncode != 0 or not exe.exists():
+        log(f"  打包失败(返回码 {proc.returncode})")
+        log((proc.stderr or proc.stdout)[-1500:])
+        return None
+    log(f"  好了:{exe.name},{exe.stat().st_size / 1048576:.1f} MB")
+    return exe
+
+
+def run(exe: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """跑子命令。强制子进程用 UTF-8 输出。
+
+    不设 PYTHONIOENCODING 的话,Windows 上写到管道用的是本地代码页(中文机器
+    上是 GBK),我们按 UTF-8 解就会把中文解成乱码,然后判据全部落空 ——
+    看起来像 exe 坏了,其实是这边解错了。
+    """
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    return subprocess.run(
+        [str(exe), *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout, env=env,
+    )
+
+
+def check_doctor(exe: Path) -> bool:
+    """doctor 会把界面目录、数据库路径都打出来,一条命令能验好几件事。"""
+    log("\n[3/5] 冻结后的 doctor")
+    try:
+        proc = run(exe, "doctor")
+    except subprocess.TimeoutExpired:
+        log("  超时")
+        return False
+    if proc.returncode != 0:
+        log(f"  返回码 {proc.returncode}")
+        log((proc.stderr or proc.stdout)[-1200:])
+        return False
+
+    out = proc.stdout
+    ok = True
+
+    # 界面目录必须落在解包出来的临时目录里,而且确实存在
+    if "警告:界面目录不存在" in out:
+        log("  BAD web/ 没打进去 —— serve 会全 404")
+        ok = False
+    else:
+        log("  OK  界面目录找得到(web/ 打进去了)")
+
+    # 数据库不能跟着跑到 _MEIPASS —— 那是临时目录,进程一退就没了,
+    # 用户的历史快照会每次都丢。
+    # 认路径本身而不认中间的中文标签:标签一改这里就瞎了,而 .db 结尾的
+    # 那行路径是我们真正要检查的东西。
+    db_lines = [ln.strip() for ln in out.splitlines()
+                if ln.strip().lower().endswith("strata.db")]
+    if db_lines:
+        db = db_lines[0].split(":", 1)[-1].strip()
+        good = "AppData" in db and "_MEI" not in db
+        log(f"  {'OK ' if good else 'BAD'} 数据库落在 {db}")
+        ok &= good
+    else:
+        log("  BAD doctor 输出里找不到 .db 路径。实际输出:")
+        for ln in out.splitlines()[:12]:
+            log(f"       | {ln.rstrip()}")
+        ok = False
+
+    # 盘和快照都读到了,说明 store/ntfs 那几个模块在冻结环境里 import 成功
+    if "读不到" in out:
+        log("  注意:有盘读不到(可能是没提权,普通权限下也正常)")
+    if "快照" in out:
+        log("  OK  数据库读得动(快照信息出来了)")
+    return ok
+
+
+def check_subcommands(exe: Path) -> bool:
+    """每个子命令都会 import 一批模块,漏打包的话这里就崩。"""
+    log("\n[4/5] 各子命令的 import(冻结后最容易漏这个)")
+    ok = True
+    for args, expect in (
+        # 探测串一律用 ASCII:中文会被 argparse 按宽度折行,用它当判据容易误报。
+        (["--help"], "{serve,scan,schedule,doctor}"),
+        (["scan", "--help"], "--drives"),
+        (["serve", "--help"], "--no-browser"),
+        (["schedule", "--help"], "--at"),
+        (["schedule", "status"], None),          # 真跑,会 import schedule 模块
+    ):
+        label = " ".join(args)
+        try:
+            proc = run(exe, *args, timeout=60)
+        except subprocess.TimeoutExpired:
+            log(f"  BAD {label}:超时")
+            ok = False
+            continue
+        blob = proc.stdout + proc.stderr
+        bad = ("Traceback" in blob or "ModuleNotFoundError" in blob
+               or "ImportError" in blob)
+        if bad:
+            log(f"  BAD {label}:{blob.strip().splitlines()[-1][:120]}")
+            ok = False
+            continue
+        if expect and expect not in blob:
+            log(f"  BAD {label}:输出里没有预期内容 {expect!r}")
+            ok = False
+            continue
+        log(f"  OK  {label}")
+    return ok
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """把整棵进程树杀干净。
+
+    单文件 exe 的 bootloader 会先把自己解包,再起一个子进程跑真正的程序。
+    只 terminate() 父进程的话,那个子进程还活着,继续占着端口 ——
+    下次验就起不来了,而且它接着写我们的管道,可能把调用方也卡住。
+    所以走 taskkill /T,连子进程一起收掉。
+    """
+    if proc.poll() is None:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    # 关掉管道,免得读端还挂在上面
+    if proc.stdout:
+        proc.stdout.close()
+
+
+def check_serve(exe: Path) -> bool:
+    """真起一次服务,把界面和各个接口拉下来看。"""
+    log("\n[5/5] 冻结后的 serve(真起服务)")
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.Popen(
+        [str(exe), "serve", "--port", str(PORT), "--no-browser"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", env=env,
+    )
+    base = f"http://127.0.0.1:{PORT}"
+    try:
+        # 单文件 exe 冷启动要先解包,给它几秒
+        ready = False
+        for _ in range(60):
+            if proc.poll() is not None:
+                log(f"  进程提前退了(返回码 {proc.returncode})")
+                log((proc.stdout.read() if proc.stdout else "")[-1200:])
+                return False
+            try:
+                with urllib.request.urlopen(base + "/", timeout=2) as r:
+                    if r.status == 200:
+                        ready = True
+                        break
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.5)
+        if not ready:
+            log("  起不来(30 秒内没响应)")
+            return False
+        log("  OK  服务起来了")
+
+        ok = True
+        # 界面三件套:HTML/JS/CSS 都得从 _MEIPASS 里发得出来
+        for path, probe in (("/", "<html"), ("/app.js", "function"),
+                            ("/app.css", "{")):
+            try:
+                with urllib.request.urlopen(base + path, timeout=5) as r:
+                    body = r.read().decode("utf-8", "replace")
+                good = r.status == 200 and probe in body.lower()
+                log(f"  {'OK ' if good else 'BAD'} {path}({len(body):,} 字节)")
+                ok &= good
+            except Exception as exc:                  # noqa: BLE001
+                log(f"  BAD {path}:{type(exc).__name__}: {exc}")
+                ok = False
+
+        # 每个接口都打一遍。它们分别走 analysis/、store/、ntfs/ 里不同的模块,
+        # 漏打包的模块只有在真正调到它的那个接口上才会现形。
+        for path in ("/api/status?drive=C:",
+                     "/api/timeline?drive=C:&days=30",
+                     "/api/tree?drive=C:",
+                     "/api/hotspots?drive=C:",
+                     "/api/diff?drive=C:",
+                     "/api/snapshots?drive=C:",
+                     "/api/changes?drive=C:",
+                     "/api/scan/state",
+                     "/api/schedule"):
+            try:
+                with urllib.request.urlopen(base + path, timeout=60) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                keys = ", ".join(list(data)[:4]) if isinstance(data, dict) else f"{len(data)} 项"
+                log(f"  OK  {path} → {keys}")
+            except Exception as exc:                  # noqa: BLE001
+                log(f"  BAD {path}:{type(exc).__name__}: {exc}")
+                ok = False
+
+        # reveal 只验它的拒绝路径 —— 成功路径会真弹资源管理器窗口出来
+        try:
+            req = urllib.request.Request(
+                base + "/api/reveal", method="POST",
+                data=json.dumps({"drive": "C:", "path": "Strata-verify-no-such"}).encode(),
+                headers={"Content-Type": "application/json", "Origin": base},
+            )
+            urllib.request.urlopen(req, timeout=10)
+            log("  BAD /api/reveal 对不存在的路径居然成功了")
+            ok = False
+        except urllib.error.HTTPError as err:
+            good = err.code == 404
+            log(f"  {'OK ' if good else 'BAD'} /api/reveal 不存在的路径 → {err.code}")
+            ok &= good
+        except Exception as exc:                      # noqa: BLE001
+            log(f"  BAD /api/reveal:{type(exc).__name__}: {exc}")
+            ok = False
+        return ok
+    finally:
+        kill_tree(proc)
+
+
+def main() -> int:
+    if sys.platform != "win32":
+        log("只在 Windows 上有意义。")
+        return 1
+
+    log("验证 Strata 打包产物")
+    log("=" * 52)
+
+    results = {"manifest": check_manifest()}
+    workdir = Path(tempfile.mkdtemp(prefix="tc-verify-"))
+    try:
+        exe = build_test_exe(workdir)
+        if exe is None:
+            results["build"] = False
+        else:
+            results["doctor"] = check_doctor(exe)
+            results["subcommands"] = check_subcommands(exe)
+            results["serve"] = check_serve(exe)
+    finally:
+        # ignore_errors 会在文件被占用时默默放弃,留下 9 MB 在临时目录里。
+        # 说一声,不然攒起来没人知道。
+        shutil.rmtree(workdir, ignore_errors=True)
+        if workdir.exists():
+            log(f"\n注意:临时目录没删掉(可能还有进程占着):{workdir}")
+
+    log("\n" + "=" * 52)
+    bad = [k for k, v in results.items() if not v]
+    for name, good in results.items():
+        log(f"  {'通过' if good else '失败'}  {name}")
+    if bad:
+        log(f"\n有问题:{', '.join(bad)}")
+        return 1
+    log("\n全部通过。dist/Strata.exe 可以发出去了。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
