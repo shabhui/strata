@@ -1327,6 +1327,9 @@ function renderChanges(ch) {
 
 // ---- 扫描 ----
 function setScanState(state) {
+  // 存下来,换盘的时候要按新的 S.drive 重画一遍(那个"是哪个盘扫的"的前缀
+  // 得跟着变)。以前不存,于是这一行只在扫描时更新,切了盘还挂着旧措辞。
+  S.scan = state;
   const btn = el('scanBtn');
   const label = el('scanState');
   const running = !!(state && state.running);
@@ -1337,16 +1340,22 @@ function setScanState(state) {
   }
   if (!label) return;
   clear(label);
+  // 这一行讲的是"刚才那一次扫描",而 /api/scan/state 是全局的:扫完 D: 再切到
+  // C:,这里照样印 D: 那次的时间和耗时,而它挨着 C: 的盘符和 C: 的数字 ——
+  // 读起来就是"C: 是 09:52 扫的、花了 33.7 秒",两个数都是假的(C: 实际 07:48
+  // 扫的、花了 119 秒)。所以盘符跟当前看的不是一个时,必须写出来是哪个盘。
+  // 不直接藏掉:扫描失败这种事不该因为切了个盘就没人告诉你。
+  const other = state && state.drive && state.drive !== S.drive ? state.drive + ' ' : '';
   if (running) {
     const phase = state.phase || '正在扫描';
     label.appendChild(tag('span', null, `${state.drive || ''} ${phase},大盘要几十秒`));
     label.hidden = false;
   } else if (state && state.error) {
-    label.appendChild(tag('span', { class: 'bad' }, '上次扫描失败:' + state.error));
+    label.appendChild(tag('span', { class: 'bad' }, other + '上次扫描失败:' + state.error));
     label.hidden = false;
   } else if (state && state.finished_at) {
     const r = state.result || {};
-    const bits = ['扫完于 ' + fmtTime(state.finished_at)];
+    const bits = [other + '扫完于 ' + fmtTime(state.finished_at)];
     if (r.method) bits.push(r.method === 'mft' ? 'MFT' : '目录遍历');
     if (r.duration_ms) bits.push((r.duration_ms / 1000).toFixed(1) + ' 秒');
     label.appendChild(tag('span', { class: 'dim' }, bits.join(' · ')));
@@ -1477,6 +1486,7 @@ async function loadDrive(drive, opts) {
   S.tlAnimated = false;
   renderDriveTabs();
   renderBaseline();
+  if (S.scan) setScanState(S.scan);   // "是哪个盘扫的"那个前缀要按新的 S.drive 重算
 
   const jobs = [
     // 基线数字必须跟着重取。S.drives 原来只在开机时填一次,之后再没动过 ——
