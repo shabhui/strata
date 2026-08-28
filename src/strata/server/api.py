@@ -299,8 +299,9 @@ def get_changes(conn: sqlite3.Connection, params: dict) -> dict:
             }
             for r in rows
         ],
-        "note": "USN 日志不记录文件大小,这里的字节数是从历史快照反查的,"
-                "查不到就留空。",
+        # 这里原来带一条中文说明。它是一句固定的话,没有后端才知道的参数,
+        # 所以现在由前端自己出(web/i18n.js 的 del.sizeNote)—— 从后端送
+        # 中文过来的话,英文界面上这一句会是唯一的中文。
     }
 
 

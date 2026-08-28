@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import time
 import unittest
+import unittest.mock
 from datetime import date, datetime, timedelta
 
+from strata import config
 from strata.analysis import diff, hotspots, timeline
 from strata.store import db
 
@@ -843,13 +845,41 @@ class DiffTest(AnalysisFixture):
             taken_at=ts_at(0), scanned=100 * MB, dirs={"A": 20 * MB}, files={"A\\x": 20 * MB}
         )
         d = diff.diff_snapshots(self.conn, a, b)
-        self.assertTrue(any("降级" in c for c in d.caveats))
+        self.assertIn("demoted", [c["code"] for c in d.caveats])
+
+    def test_demoted_caveat_numbers_follow_config(self) -> None:
+        """「深度超过 3 层、小于 64 MB」这两个数字必须跟着 config 变。
+
+        原来它们是手写在中文句子里的。改了 config.DEMOTE_* 之后,界面上那句话
+        就是一句错话 —— 而且没有任何测试会红:文案对不对没人验,降级行为本身
+        用的是 config,两边各说各话也照样通过。
+
+        这里把 config 改掉再看输出跟不跟,而不是拿输出和 config 比。比相等
+        测不出这件事:写死的 3 恰好就等于现在的 config 值,断言照样通过,
+        改回写死的也照样绿 —— 这个变异体真的逃过一次。
+        """
+        a = self.add_snapshot(
+            taken_at=ts_at(-1), scanned=100 * MB, dirs={"A": 10 * MB},
+            files={"A\\x": 10 * MB}, note="[已降级]",
+        )
+        b = self.add_snapshot(
+            taken_at=ts_at(0), scanned=100 * MB, dirs={"A": 20 * MB}, files={"A\\x": 20 * MB}
+        )
+
+        with unittest.mock.patch.object(config, "DEMOTE_DIR_MAX_DEPTH", 9), \
+             unittest.mock.patch.object(config, "DEMOTE_DIR_MIN_BYTES", 7 * MB):
+            d = diff.diff_snapshots(self.conn, a, b)
+
+        note = next(c for c in d.caveats if c["code"] == "demoted")
+        self.assertEqual(note["vars"]["depth"], 9)
+        self.assertEqual(note["vars"]["bytes"], 7 * MB)
+        self.assertEqual(note["vars"]["n"], 1)
 
     def test_mixed_method_caveat(self) -> None:
         a = self.add_snapshot(taken_at=ts_at(-1), scanned=100 * MB, method="mft")
         b = self.add_snapshot(taken_at=ts_at(0), scanned=100 * MB, method="scandir")
         d = diff.diff_snapshots(self.conn, a, b)
-        self.assertTrue(any("扫描方式不同" in c for c in d.caveats))
+        self.assertIn("mixedMethod", [c["code"] for c in d.caveats])
 
     def test_no_file_rows_caveat(self) -> None:
         a = self.add_snapshot(taken_at=ts_at(-1), scanned=100 * MB, dirs={"A": 10 * MB})
@@ -857,7 +887,7 @@ class DiffTest(AnalysisFixture):
         d = diff.diff_snapshots(self.conn, a, b)
 
         self.assertEqual(d.file_deltas, [])
-        self.assertTrue(any("只能对比目录" in c for c in d.caveats))
+        self.assertIn("noFilesEitherSide", [c["code"] for c in d.caveats])
 
     def test_one_side_missing_files_caveat(self) -> None:
         a = self.add_snapshot(taken_at=ts_at(-1), scanned=100 * MB, dirs={"A": 10 * MB})
@@ -867,13 +897,13 @@ class DiffTest(AnalysisFixture):
         d = diff.diff_snapshots(self.conn, a, b)
 
         self.assertEqual(d.file_deltas, [])
-        self.assertTrue(any("跳过文件级对比" in c for c in d.caveats))
+        self.assertIn("noFilesOneSide", [c["code"] for c in d.caveats])
 
     def test_threshold_caveat_when_both_have_files(self) -> None:
         a = self.add_snapshot(taken_at=ts_at(-1), scanned=100 * MB, files={"a": 10 * MB})
         b = self.add_snapshot(taken_at=ts_at(0), scanned=100 * MB, files={"a": 30 * MB})
         d = diff.diff_snapshots(self.conn, a, b)
-        self.assertTrue(any("新出现" in c for c in d.caveats))
+        self.assertIn("fileThreshold", [c["code"] for c in d.caveats])
 
     def test_grew_shrank_helpers(self) -> None:
         a = self.add_snapshot(
@@ -958,10 +988,10 @@ class HotspotsTest(AnalysisFixture):
     def test_classify_path_hits_and_misses(self) -> None:
         hit = hotspots.classify_path(r"Users\me\AppData\Local\Temp")
         self.assertIsNotNone(hit)
-        self.assertEqual(hit[2], "safe")
+        self.assertEqual(hit, ("userTemp", "safe"))
 
         careful = hotspots.classify_path(r"Windows\WinSxS")
-        self.assertEqual(careful[2], "careful")
+        self.assertEqual(careful, ("winSxs", "careful"))
 
         self.assertIsNone(hotspots.classify_path(r"Users\me\Documents\thesis"))
 

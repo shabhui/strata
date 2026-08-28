@@ -47,7 +47,9 @@ class StaticServingTest(unittest.TestCase):
         self.assertIn(b"<html", body.lower())
 
     def test_serves_known_assets(self) -> None:
-        for name in ("/app.js", "/app.css"):
+        # i18n.js 少了的话页面上每个 data-i18n 节点都会停在 HTML 里的中文默认值,
+        # 而 app.js 一上来就调 t(),整页直接白 —— 属于「404 一个文件就全废」。
+        for name in ("/app.js", "/app.css", "/i18n.js"):
             with self.subTest(name=name):
                 status, body = self.get(name)
                 self.assertEqual(status, 200)

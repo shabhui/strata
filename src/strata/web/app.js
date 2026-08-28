@@ -13,6 +13,13 @@ const S = {
   timeline: null,
   tree: null,
   hotspots: null,
+  /* 这两块原来是拿到就画、不留底 —— 切语言时没有数据可以重画,那两段
+   * 会留在旧语言上,一屏里中英混着。所以存下来。 */
+  diff: null,
+  changes: null,
+  scan: null,          // 扫描进度,setScanState 填
+  schedule: null,      // 计划任务状态,loadSchedule 填
+  banner: null,        // 当前横幅,见 banner()
   path: '',
   ageFilter: null,     // null = 全部
   fade: new Map(),     // path -> 当前透明度,用于补间
@@ -39,15 +46,22 @@ const TL_MIN_DAYS = 5;
  * 一格高度,压在零线附近正好。 */
 const TL_LOG_K = 1024 * 1024;
 
-// 年龄色阶,和 CSS 里的 --age-* 对齐
+/* 年龄色阶,和 CSS 里的 --age-* 对齐。
+ *
+ * 存的是文案的键,不是文案本身。这是模块级常量,只在加载时求值一次 ——
+ * 存成文字的话,切换语言之后色带上还是旧语言,而其他地方都变了。
+ * 用 band.label 这个 getter 读,每次现取。 */
 const AGE_BANDS = [
-  { key: 'today',   max: 1,    label: '今天',     color: '#ff5c39' },
-  { key: 'week',    max: 7,    label: '本周',     color: '#ff9e2c' },
-  { key: 'month',   max: 30,   label: '本月',     color: '#e8c46a' },
-  { key: 'quarter', max: 90,   label: '三个月内', color: '#8fbf9f' },
-  { key: 'year',    max: 365,  label: '一年内',   color: '#4e93a8' },
-  { key: 'older',   max: null, label: '更早',     color: '#2f5d72' },
-];
+  { key: 'today',   max: 1,    color: '#ff5c39' },
+  { key: 'week',    max: 7,    color: '#ff9e2c' },
+  { key: 'month',   max: 30,   color: '#e8c46a' },
+  { key: 'quarter', max: 90,   color: '#8fbf9f' },
+  { key: 'year',    max: 365,  color: '#4e93a8' },
+  { key: 'older',   max: null, color: '#2f5d72' },
+].map((b) => Object.defineProperty(b, 'label', {
+  get() { return t('age.' + this.key); },
+  enumerable: true,
+}));
 
 const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -69,21 +83,42 @@ function fmtSigned(n) {
 }
 
 function fmtCount(n) {
-  return (n === null || n === undefined) ? '—' : n.toLocaleString('zh-CN');
+  return (n === null || n === undefined) ? '—' : n.toLocaleString(I18N.locale);
 }
 
 function fmtTime(ts) {
   if (!ts) return '—';
   const d = new Date(ts * 1000);
   const p = (x) => String(x).padStart(2, '0');
+  // 年月日时分用 ISO 顺序,两种语言都不变:2026-08-28 19:32 没有歧义,
+  // 而 08/28 还是 28/08 得看读者是哪儿的人。
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/* 只有月日的短格式。这个必须分语言 ——「01-05」中文读者看是 1 月 5 日,
+ * 英文读者一半会读成 5 月 1 日。英文给月份缩写,歧义就没了。 */
 function fmtDay(ts) {
   if (!ts) return '—';
-  const d = new Date(ts * 1000);
+  return shortDay(new Date(ts * 1000));
+}
+
+/* 后端给的是 'YYYY-MM-DD' 字符串,时间轴横轴用它。
+ * 按 UTC 拆字符串,不走 new Date(str) —— 那个会按本地时区偏移,
+ * 东八区能把 8 月 28 日显示成 8 月 27 日。 */
+function fmtDayISO(iso) {
+  if (!iso) return '—';
+  if (I18N.lang !== 'en') return iso.slice(5);
+  const [y, m, d] = iso.split('-').map(Number);
+  if (!y || !m || !d) return iso.slice(5);
+  return shortDay(new Date(y, m - 1, d));
+}
+
+function shortDay(date) {
   const p = (x) => String(x).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  if (I18N.lang === 'en') {
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+  return `${p(date.getMonth() + 1)}-${p(date.getDate())}`;
 }
 
 function daysAgo(ts) {
@@ -102,12 +137,13 @@ function ageBand(ts) {
 
 function ageText(ts) {
   const d = daysAgo(ts);
-  if (d === null) return '未知';
-  if (d < 1) return '今天';
-  if (d < 2) return '昨天';
-  if (d < 30) return Math.round(d) + ' 天前';
-  if (d < 365) return Math.round(d / 30) + ' 个月前';
-  return (d / 365).toFixed(1) + ' 年前';
+  if (d === null) return t('age.unknown');
+  if (d < 1) return t('age.today');
+  if (d < 2) return t('age.yesterday');
+  // 英文要区分单复数,所以把数字交给文案函数,别在这儿拼字符串
+  if (d < 30) return t('age.daysAgo', { n: Math.round(d) });
+  if (d < 365) return t('age.monthsAgo', { n: Math.round(d / 30) });
+  return t('age.yearsAgo', { n: (d / 365).toFixed(1) });
 }
 
 function el(id) { return document.getElementById(id); }
@@ -130,8 +166,8 @@ async function api(path, params) {
     if (params[k] !== null && params[k] !== undefined) url.searchParams.set(k, params[k]);
   }
   const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  const body = await res.json().catch(() => ({ error: '返回的不是 JSON' }));
-  if (!res.ok) throw new Error(body.error || `请求失败(${res.status})`);
+  const body = await res.json().catch(() => ({ error: t('err.notJson') }));
+  if (!res.ok) throw new Error(body.error || t('err.request', { status: res.status }));
   return body;
 }
 
@@ -142,7 +178,7 @@ async function post(path, payload) {
     body: JSON.stringify(payload || {}),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || body.message || `请求失败(${res.status})`);
+  if (!res.ok) throw new Error(body.error || body.message || t('err.request', { status: res.status }));
   return body;
 }
 
@@ -156,7 +192,7 @@ function renderDriveTabs() {
       role: 'tab',
       'aria-selected': d.drive === S.drive ? 'true' : 'false',
       'data-absent': d.present ? '0' : '1',
-      title: d.present ? '' : '这个盘现在读不到,显示的是历史数据',
+      title: d.present ? '' : t('base.offline'),
     }, d.drive);
     btn.addEventListener('click', () => selectDrive(d.drive));
     box.appendChild(btn);
@@ -174,13 +210,13 @@ function renderBaseline() {
 
   if (d.live_total_bytes) {
     const usedPct = (d.live_used_bytes / d.live_total_bytes * 100).toFixed(1);
-    parts.push(['已用', `${fmtBytes(d.live_used_bytes)} / ${fmtBytes(d.live_total_bytes)}`, `${usedPct}%`]);
-    parts.push(['可用', fmtBytes(d.live_free_bytes), null]);
+    parts.push([t('base.used'), `${fmtBytes(d.live_used_bytes)} / ${fmtBytes(d.live_total_bytes)}`, `${usedPct}%`]);
+    parts.push([t('base.free'), fmtBytes(d.live_free_bytes), null]);
   }
   if (snap) {
-    parts.push(['扫到', fmtBytes(snap.scanned_bytes), snap.method === 'mft' ? 'MFT' : '目录遍历']);
-    parts.push(['文件', fmtCount(snap.file_count), null]);
-    parts.push(['快照', `${fmtCount(d.snapshot_count)} 个`, null]);
+    parts.push([t('base.scanned'), fmtBytes(snap.scanned_bytes), snap.method === 'mft' ? 'MFT' : t('base.walkMode')]);
+    parts.push([t('base.files'), fmtCount(snap.file_count), null]);
+    parts.push([t('base.snapshots'), t('base.snapshotCount', { n: fmtCount(d.snapshot_count) }), null]);
   }
 
   for (const [label, value, extra] of parts) {
@@ -192,8 +228,8 @@ function renderBaseline() {
   }
 
   const asOf = tag('span', { style: 'margin-left:auto' });
-  asOf.appendChild(tag('span', { class: 'dim' }, snap ? 'as of ' : ''));
-  asOf.appendChild(tag('b', null, snap ? fmtTime(snap.taken_at) : '尚无快照'));
+  asOf.appendChild(tag('span', { class: 'dim' }, snap ? t('base.asOf') : ''));
+  asOf.appendChild(tag('b', null, snap ? fmtTime(snap.taken_at) : t('base.noSnapshot')));
   box.appendChild(asOf);
 
   // 快照自带的口径说明。退回目录遍历时,上面那几个数字的含义变了(硬链接重复
@@ -227,7 +263,7 @@ function renderLegend() {
       class: 'legend-item',
       style: `--swatch:${band.color}`,
       'aria-pressed': S.ageFilter === band.key ? 'true' : 'false',
-      title: `只显示${band.label}写入的部分`,
+      title: t('tm.onlyBand', { band: band.label }),
     });
     btn.appendChild(tag('span', { class: 'legend-label' }, band.label));
     btn.appendChild(tag('span', { class: 'legend-value' },
@@ -385,7 +421,7 @@ function paintTreemap(ctx, W, H) {
     ctx.fillStyle = '#47646a';
     ctx.font = '13px "Segoe UI", "Microsoft YaHei UI", sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('这里还没有数据,先扫一次', W / 2, H / 2);
+    ctx.fillText(t('tm.empty'), W / 2, H / 2);
     ctx.textAlign = 'left';
     return;
   }
@@ -469,15 +505,15 @@ function bindTreemap() {
     tip.appendChild(tag('div', { class: 'p' }, it.path || it.name));
     const meta = tag('div', { class: 'm' });
     meta.appendChild(tag('b', null, fmtBytes(it.bytes)));
-    if (share) meta.appendChild(document.createTextNode(`  占本层 ${share}`));
-    if (it.files) meta.appendChild(document.createTextNode(`  ${fmtCount(it.files)} 个文件`));
+    if (share) meta.appendChild(document.createTextNode(t('tm.shareOfLevel', { share: share })));
+    if (it.files) meta.appendChild(document.createTextNode('  ' + t('grid.fileCount', { n: fmtCount(it.files) })));
     tip.appendChild(meta);
     const age = tag('div', { class: 'm' });
-    age.appendChild(document.createTextNode('最近写入 '));
+    age.appendChild(document.createTextNode(t('tm.lastWrite')));
     age.appendChild(tag('b', null, ageText(it.ctime)));
     if (it.ctime) age.appendChild(document.createTextNode('  ' + fmtTime(it.ctime)));
     tip.appendChild(age);
-    if (it.isDir) tip.appendChild(tag('div', { class: 'm hint' }, '点击进入'));
+    if (it.isDir) tip.appendChild(tag('div', { class: 'm hint' }, t('tm.clickEnter')));
     showTip(tip, ev);
     canvas.style.cursor = it.isDir ? 'pointer' : 'default';
   });
@@ -546,6 +582,7 @@ function hideTip(tip) {
 function renderCrumbs() {
   const box = el('crumbs');
   clear(box);
+  if (!S.drive) return;          // 还没选盘,别印出「null\」
   const root = S.drive + '\\';
   const mk = (label, path, active) => {
     const btn = tag('button', { class: active ? 'crumb-current' : 'crumb' }, label);
@@ -556,7 +593,7 @@ function renderCrumbs() {
   const cur = S.path || '';
   mk(root, '', cur === '');
   if (!cur) {
-    box.appendChild(tag('span', { class: 'crumb-sep dim' }, '点块进入子目录'));
+    box.appendChild(tag('span', { class: 'crumb-sep dim' }, t('tm.crumbHint')));
     return;
   }
 
@@ -783,9 +820,10 @@ function renderTimeline() {
       g.appendChild(svg('line', {
         x1: x, x2: x, y1: M.top - 6, y2: M.top + plotH + 4, class: 'tl-boundary',
       }));
-      const t = svg('text', { x: x + 5, y: M.top - 8, class: 'tl-boundary-label' });
-      t.textContent = '↓ 从这里开始是实测';
-      g.appendChild(t);
+      // 变量别叫 t —— 全局的 t() 是取文案的,叫 t 就把它遮住了
+      const label = svg('text', { x: x + 5, y: M.top - 8, class: 'tl-boundary-label' });
+      label.textContent = t('tl.measuredStart');
+      g.appendChild(label);
       host.appendChild(g);
     }
   }
@@ -839,11 +877,21 @@ function renderTimeline() {
 
   /* 日期标签:间隔着标,不然挤成一片。最后一天一定要标(那是「今天」,
    * 是最常看的一格),所以倒数第二个刻度离它太近时让路 —— 不然
-   * 「08-25 08-27」会叠在一起糊成一团。 */
+   * 「08-25 08-27」会叠在一起糊成一团。
+   *
+   * 标签宽度按语言取:这里的坐标是 viewBox 单位(固定 1000 宽),不是屏幕
+   * 像素。.tl-day 在 viewBox 里约 10 单位高,"08-25" 实测占 30 上下,
+   * "Aug 25" 占 39 —— 英文更宽,所以让路的阈值也得更大,否则英文下
+   * 「Aug 25 Aug 27」会贴在一起。
+   *
+   * 只按语言分,不按窗口宽度分:viewBox 是死的 1000,整张图靠 CSS 缩放,
+   * 所以窗口变窄时字和间距一起缩,标签之间的相对关系不变 —— 按 plotW 算
+   * 「放得下几个」永远得到同一个数。(缩到手机宽度时字会小到看不清,那是
+   * 固定 viewBox 的老问题,不是标签数量能解决的。) */
+  const labelW = I18N.lang === 'en' ? 44 : 38;
   const stride = Math.max(1, Math.ceil(days.length / 12));
   const last = days.length - 1;
-  const MIN_LABEL_GAP = 40;                    // 约等于 "08-25" 的字宽加余量
-  const crowded = (last % stride) * slot < MIN_LABEL_GAP;
+  const crowded = (last % stride) * slot < labelW;
   const gLab = svg('g');
   days.forEach((d, i) => {
     if (i !== last) {
@@ -851,12 +899,12 @@ function renderTimeline() {
       // 挤到最后一格的那个刻度直接不画
       if (crowded && i + stride > last) return;
     }
-    const t = svg('text', {
+    const label = svg('text', {
       x: (M.left + i * slot + slot / 2).toFixed(2),
       y: H - 8, class: 'tl-day', 'text-anchor': 'middle',
     });
-    t.textContent = d.day.slice(5);
-    gLab.appendChild(t);
+    label.textContent = fmtDayISO(d.day);
+    gLab.appendChild(label);
   });
   host.appendChild(gLab);
 
@@ -902,8 +950,8 @@ function renderTlZoom() {
   if (label) {
     const days = tl.days;
     label.textContent = full
-      ? `全部 ${total} 天`
-      : `${days[from].day} → ${days[to - 1].day}  共 ${span} 天`;
+      ? t('tl.allDays', { n: total })
+      : t('tl.rangeSpan', { from: days[from].day, to: days[to - 1].day, n: span });
   }
   const dis = (id, off) => { const b = el(id); if (b) b.disabled = off; };
   dis('tlZoomOut', full);
@@ -1017,6 +1065,7 @@ function bindTimelineZoom() {
   on('tlRight', () => { const [f, t] = tlWindow(); tlPan(Math.max(1, Math.round((t - f) / 2))); });
 
   // 预设范围。比反复滚滚轮快,也是给不知道能滚的人一个入口。
+  paintSpanButtons();
   document.querySelectorAll('#tlZoom [data-span]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const total = (S.timeline && S.timeline.days) ? S.timeline.days.length : 0;
@@ -1029,6 +1078,14 @@ function bindTimelineZoom() {
   });
 }
 
+/* 「7 天 / 14 天 / 30 天」。数字在 data-span 上,文案在这儿拼 ——
+ * 写死在 HTML 里的话切了语言还是中文。 */
+function paintSpanButtons() {
+  document.querySelectorAll('#tlZoom [data-span]').forEach((btn) => {
+    btn.textContent = t('tl.spanDays', { n: Number(btn.dataset.span) });
+  });
+}
+
 function showDayTip(d, ev) {
   const tip = el('tlTip');
   clear(tip);
@@ -1037,7 +1094,7 @@ function showDayTip(d, ev) {
   const head = tag('div', { class: 'p' });
   head.appendChild(document.createTextNode(d.day + '  '));
   head.appendChild(tag('span', { class: 'badge ' + (retro ? 'retro' : 'measured') },
-    retro ? '回溯' : '实测'));
+    retro ? t('basis.retroShort') : t('basis.measuredShort')));
   tip.appendChild(head);
 
   // 回溯日只有一个量:那天写入、现在还在盘上多少。它的 added 和 net 是同一个
@@ -1045,30 +1102,30 @@ function showDayTip(d, ev) {
   // 当天的净变化 —— 而回溯恰恰答不了那个问题。
   const m = tag('div', { class: 'm' });
   if (retro) {
-    m.appendChild(document.createTextNode('写入还在盘上 '));
+    m.appendChild(document.createTextNode(t('tip.stillOnDisk')));
     m.appendChild(tag('b', null, fmtBytes(d.added || 0)));
   } else {
-    m.appendChild(document.createTextNode('新增 '));
+    m.appendChild(document.createTextNode(t('tip.added')));
     m.appendChild(tag('b', null, fmtBytes(d.added || 0)));
     if (d.removed) {
-      m.appendChild(document.createTextNode('  减少 '));
+      m.appendChild(document.createTextNode(t('tip.removed')));
       m.appendChild(tag('b', null, fmtBytes(d.removed)));
     }
-    m.appendChild(document.createTextNode('  净 '));
+    m.appendChild(document.createTextNode(t('tip.net')));
     m.appendChild(tag('b', null, fmtSigned(d.net || 0)));
   }
   tip.appendChild(m);
 
   if (d.files_added) {
-    tip.appendChild(tag('div', { class: 'm' }, `${fmtCount(d.files_added)} 个文件`));
+    tip.appendChild(tag('div', { class: 'm' }, t('grid.fileCount', { n: fmtCount(d.files_added) })));
   }
 
   // USN 能补上「当天删了几个」,这是快照差看不到的
   if (d.usn && (d.usn.deleted || d.usn.created)) {
     const u = tag('div', { class: 'm' });
-    u.appendChild(document.createTextNode('变更日志:建 '));
+    u.appendChild(document.createTextNode(t('tip.journalCreated')));
     u.appendChild(tag('b', null, fmtCount(d.usn.created)));
-    u.appendChild(document.createTextNode('  删 '));
+    u.appendChild(document.createTextNode(t('tip.journalDeleted')));
     u.appendChild(tag('b', null, fmtCount(d.usn.deleted)));
     tip.appendChild(u);
   }
@@ -1082,8 +1139,8 @@ function showDayTip(d, ev) {
   // 要到处写 abs)。显示时必须自己带上负号,否则 fmtSigned 会给它加个加号,
   // 把「缩了 753 MB」印成「+753 MB」。
   for (const [label, list, sign] of [
-    ['长得最多', d.contributors, 1],
-    ['缩得最多', d.shrinkers, -1],
+    [t('tip.grewMost'), d.contributors, 1],
+    [t('tip.shrankMost'), d.shrinkers, -1],
   ]) {
     const top = (list || []).slice(0, 4);
     if (!top.length) continue;
@@ -1098,7 +1155,7 @@ function showDayTip(d, ev) {
 
   if (retro) {
     tip.appendChild(tag('div', { class: 'm hint' },
-      '这是那天写入、现在还留在盘上的量。当天建了又删的看不到,那天删掉的旧文件也看不到 —— 不等于那天的净变化'));
+      t('tip.retroWhy')));
   }
   showTip(tip, ev);
 }
@@ -1114,17 +1171,17 @@ function renderTimelineSummary() {
       // 报 +93 GB,推出 91 天前只用了 85.6 GB,可盘上「91 天以上」的文件现在
       // 还有 81.3 GB,而那只是活下来的部分。
       if (sum.retro_days) {
-        box.appendChild(tag('span', { class: 'dim' }, `近 ${sum.days} 天写入还在盘上 `));
+        box.appendChild(tag('span', { class: 'dim' }, t('sum.retroSpan', { days: sum.days })));
         box.appendChild(tag('b', null, fmtBytes(sum.retro_bytes)));
       }
       if (sum.measured_days) {
         const net = tag('b', { class: sum.measured_net >= 0 ? 'grow' : 'shrink' },
           fmtSigned(sum.measured_net));
         box.appendChild(tag('span', { class: 'dim' },
-          `${sum.retro_days ? '  ·  ' : ''}实测 ${sum.measured_days} 天净变化 `));
+          t('sum.measuredSpan', { sep: sum.retro_days ? '  ·  ' : '', days: sum.measured_days })));
         box.appendChild(net);
         box.appendChild(tag('span', { class: 'dim' },
-          `  增 ${fmtBytes(sum.measured_added)} · 减 ${fmtBytes(sum.measured_removed)}`));
+          t('sum.addedRemoved', { added: fmtBytes(sum.measured_added), removed: fmtBytes(sum.measured_removed) })));
       }
     }
   }
@@ -1136,16 +1193,16 @@ function renderTimelineSummary() {
   if (!sum) return;
 
   const bits = [];
-  if (sum.retro_days) bits.push(`${sum.retro_days} 天回溯`);
-  if (sum.measured_days) bits.push(`${sum.measured_days} 天实测`);
-  if (sum.busiest_day) bits.push(`涨得最猛是 ${sum.busiest_day}`);
+  if (sum.retro_days) bits.push(t('sum.retroDays', { n: sum.retro_days }));
+  if (sum.measured_days) bits.push(t('sum.measuredDays', { n: sum.measured_days }));
+  if (sum.busiest_day) bits.push(t('sum.busiest', { day: sum.busiest_day }));
 
   if (!sum.measured_days) {
     const note = tag('div', { class: 'notice' });
-    note.appendChild(tag('b', null, '现在全是回溯值。'));
+    note.appendChild(tag('b', null, t('sum.allRetro')));
     note.appendChild(document.createTextNode(
-      '只有一次快照时,变化只能从现存文件的创建日期倒推 —— 删掉的东西看不见。'
-      + '再扫一次(或者开着每日快照)之后,新的日子就会变成实测。'));
+      t('sum.allRetroWhy1')
+      + t('sum.allRetroWhy2')));
     noteBox.appendChild(note);
   } else if (bits.length) {
     noteBox.appendChild(tag('p', { class: 'basis-note' }, bits.join(' · ')));
@@ -1193,11 +1250,11 @@ function bytesCell(n, cls) {
 
 function renderHotspots() {
   const h = S.hotspots || {};
-  const empty = h.snapshot ? '没有符合条件的项' : '还没有扫描数据';
+  const empty = h.snapshot ? t('grid.noMatch') : t('grid.noData');
 
   // 列顺序跟着 index.html 的表头:目录 / 占用 / 最近写入
   fillRows('bigDirsBody', (h.dirs || []).map((d) => [
-    pathCell(d.path, `${fmtCount(d.files)} 个文件`),
+    pathCell(d.path, t('grid.fileCount', { n: fmtCount(d.files) })),
     bytesCell(d.bytes),
     { text: ageText(d.newest), attrs: { class: 'num dim' }, title: fmtTime(d.newest) },
   ]), empty);
@@ -1209,14 +1266,26 @@ function renderHotspots() {
   ]), empty);
 
   // 路径 / 类型 / 占用 / 等级
-  const safety = { safe: '可删', review: '先看看', careful: '当心' };
+  //
+  // 后端只给规则代号(c.rule),标签和建议在这边按代号取 —— 见 i18n.js 末尾。
+  // 代号认不出来时退回代号本身,而不是留空:空着的话表格看起来像后端没返回
+  // 数据,而实际上是少了一条文案,两种毛病要修的地方完全不同。
+  const safety = { safe: t('clean.safe'), review: t('clean.review'), careful: t('clean.careful') };
+  const ruleText = (code, part) => {
+    if (!code) return '';
+    const key = 'clean.rule.' + code + '.' + part;
+    return I18N.raw(key) ? t(key) : code;
+  };
   const cleanup = h.cleanup || [];
-  fillRows('cleanupBody', cleanup.map((c) => [
-    pathCell(c.path, c.advice),
-    { text: c.label, attrs: { class: 'dim' }, title: c.advice },
-    bytesCell(c.bytes),
-    { node: tag('span', { class: 'tag ' + c.safety }, safety[c.safety] || c.safety) },
-  ]), '没找到明显可清的目录');
+  fillRows('cleanupBody', cleanup.map((c) => {
+    const advice = ruleText(c.rule, 'advice');
+    return [
+      pathCell(c.path, advice),
+      { text: ruleText(c.rule, 'label'), attrs: { class: 'dim' }, title: advice },
+      bytesCell(c.bytes),
+      { node: tag('span', { class: 'tag ' + c.safety }, safety[c.safety] || c.safety) },
+    ];
+  }), t('clean.none'));
 
   const total = el('cleanupTotal');
   if (total) {
@@ -1225,26 +1294,41 @@ function renderHotspots() {
       const safeBytes = cleanup.filter((c) => c.safety === 'safe')
         .reduce((s, c) => s + (c.bytes || 0), 0);
       const allBytes = cleanup.reduce((s, c) => s + (c.bytes || 0), 0);
-      total.appendChild(tag('span', { class: 'dim' }, '合计 '));
+      total.appendChild(tag('span', { class: 'dim' }, t('clean.total')));
       total.appendChild(tag('b', null, fmtBytes(allBytes)));
-      total.appendChild(tag('span', { class: 'dim' }, `,其中标「可删」 ${fmtBytes(safeBytes)}`));
+      total.appendChild(tag('span', { class: 'dim' }, t('clean.ofWhichSafe', { bytes: fmtBytes(safeBytes) })));
     }
   }
 
   const tmTotals = el('treemapTotals');
   if (tmTotals) {
     clear(tmTotals);
-    const t = treeTotal();
-    if (t) {
-      tmTotals.appendChild(tag('span', { class: 'dim' }, '本层 '));
-      tmTotals.appendChild(tag('b', null, fmtBytes(t)));
+    // 同上:别叫 t,那是取文案的全局函数
+    const total = treeTotal();
+    if (total) {
+      tmTotals.appendChild(tag('span', { class: 'dim' }, t('tm.thisLevel')));
+      tmTotals.appendChild(tag('b', null, fmtBytes(total)));
       const n = (S.tree.children || []).length;
-      tmTotals.appendChild(tag('span', { class: 'dim' }, `,${n} 项`));
+      tmTotals.appendChild(tag('span', { class: 'dim' }, t('grid.itemCount', { n: n })));
     }
   }
 }
 
+/* 后端给的口径说明:{code, vars}。文案在 i18n.js 里按 diff.caveat.<code> 取。
+ *
+ * vars.bytes 在这儿转成 vars.size(已格式化的 "64 MB")—— 文案函数不该
+ * 自己去调 fmtBytes,那个在这个文件里,i18n.js 要能单独加载。 */
+function caveatText(c) {
+  if (!c) return '';
+  if (typeof c === 'string') return c;      // 老格式:后端直接给的整句
+  const vars = Object.assign({}, c.vars);
+  if (vars.bytes !== undefined) vars.size = fmtBytes(vars.bytes);
+  const key = 'diff.caveat.' + c.code;
+  return I18N.raw(key) ? t(key, vars) : c.code;
+}
+
 function renderDiff(diff) {
+  S.diff = diff;
   const section = el('diffSection');
   const range = el('diffRange');
   const net = el('diffNet');
@@ -1262,7 +1346,7 @@ function renderDiff(diff) {
   }
   if (net) {
     clear(net);
-    net.appendChild(tag('span', { class: 'dim' }, '净变化 '));
+    net.appendChild(tag('span', { class: 'dim' }, t('diff.net')));
     net.appendChild(tag('b', { class: diff.net >= 0 ? 'grow' : 'shrink' }, fmtSigned(diff.net)));
     net.appendChild(tag('span', { class: 'dim' },
       `  ${fmtBytes(diff.before_bytes)} → ${fmtBytes(diff.after_bytes)}`));
@@ -1270,7 +1354,7 @@ function renderDiff(diff) {
   if (notice) {
     clear(notice);
     for (const c of (diff.caveats || [])) {
-      notice.appendChild(tag('p', { class: 'basis-note' }, c));
+      notice.appendChild(tag('p', { class: 'basis-note' }, caveatText(c)));
     }
   }
 
@@ -1278,11 +1362,12 @@ function renderDiff(diff) {
     pathCell(d.path, `${fmtBytes(d.before)} → ${fmtBytes(d.after)}`),
     { text: fmtSigned(d.delta), attrs: { class: 'num ' + cls } },
   ];
-  fillRows('grewBody', (diff.grew || []).map((d) => row(d, 'grow')), '没有目录变大');
-  fillRows('shrankBody', (diff.shrank || []).map((d) => row(d, 'shrink')), '没有目录变小');
+  fillRows('grewBody', (diff.grew || []).map((d) => row(d, 'grow')), t('diff.noGrow'));
+  fillRows('shrankBody', (diff.shrank || []).map((d) => row(d, 'shrink')), t('diff.noShrink'));
 }
 
 function renderChanges(ch) {
+  S.changes = ch;
   const section = el('deletedSection');
   const cov = (ch && ch.coverage) || {};
   const events = (ch && ch.events) || [];
@@ -1298,9 +1383,9 @@ function renderChanges(ch) {
   const covBox = el('usnCoverage');
   if (covBox) {
     clear(covBox);
-    covBox.appendChild(tag('span', { class: 'dim' }, '日志覆盖 '));
-    covBox.appendChild(tag('b', null, `${cov.first_day} 起 ${cov.days} 天`));
-    covBox.appendChild(tag('span', { class: 'dim' }, `,${fmtCount(cov.events)} 条`));
+    covBox.appendChild(tag('span', { class: 'dim' }, t('del.coverage')));
+    covBox.appendChild(tag('b', null, t('del.coverageSpan', { first: cov.first_day, days: cov.days })));
+    covBox.appendChild(tag('span', { class: 'dim' }, t('del.coverageEvents', { n: fmtCount(cov.events) })));
   }
 
   const notice = el('usnNotice');
@@ -1308,10 +1393,11 @@ function renderChanges(ch) {
     clear(notice);
     const unknown = deletes.filter((e) => e.bytes === null || e.bytes === undefined).length;
     const note = tag('div', { class: 'notice' });
-    if (ch.note) note.appendChild(document.createTextNode(ch.note));
+    // 这句原来是后端送过来的,现在在这边出 —— 它没有后端才知道的参数
+    note.appendChild(document.createTextNode(t('del.sizeNote')));
     if (unknown) {
       note.appendChild(document.createTextNode(
-        ` 其中 ${fmtCount(unknown)} 条在历史快照里找不到同路径的文件,大小算不出来,这里留空而不是猜。`));
+        t('del.unknownSize', { n: fmtCount(unknown) })));
     }
     if (note.childNodes.length) notice.appendChild(note);
   }
@@ -1319,15 +1405,15 @@ function renderChanges(ch) {
   fillRows('deletedBody', deletes.map((e) => [
     // 已经删掉的文件:标成文件,右键菜单里「打开上一级目录」才是能用的那一项
     pathCell(e.path || e.name, null, true),
-    { text: (e.bytes === null || e.bytes === undefined) ? '未知' : fmtBytes(e.bytes),
+    { text: (e.bytes === null || e.bytes === undefined) ? t('age.unknown') : fmtBytes(e.bytes),
       attrs: { class: 'num ' + ((e.bytes === null || e.bytes === undefined) ? 'dim' : 'shrink') } },
     { text: fmtTime(e.at), attrs: { class: 'num dim' } },
-  ]), '这段时间没有记录到删除');
+  ]), t('del.none'));
 }
 
 // ---- 扫描 ----
 function setScanState(state) {
-  // 存下来,换盘的时候要按新的 S.drive 重画一遍(那个"是哪个盘扫的"的前缀
+  // 存下来,换盘的时候要按新的 S.drive 重画一遍(那个t('err.whichDrive')的前缀
   // 得跟着变)。以前不存,于是这一行只在扫描时更新,切了盘还挂着旧措辞。
   S.scan = state;
   const btn = el('scanBtn');
@@ -1336,7 +1422,7 @@ function setScanState(state) {
   if (btn) {
     btn.disabled = running;
     btn.classList.toggle('pulse', running);
-    btn.textContent = running ? '扫描中……' : '扫描本盘';
+    btn.textContent = running ? t('scan.running') : t('nav.scan');
   }
   if (!label) return;
   clear(label);
@@ -1347,17 +1433,17 @@ function setScanState(state) {
   // 不直接藏掉:扫描失败这种事不该因为切了个盘就没人告诉你。
   const other = state && state.drive && state.drive !== S.drive ? state.drive + ' ' : '';
   if (running) {
-    const phase = state.phase || '正在扫描';
-    label.appendChild(tag('span', null, `${state.drive || ''} ${phase},大盘要几十秒`));
+    const phase = state.phase || t('scan.inProgress');
+    label.appendChild(tag('span', null, t('scan.phase', { drive: state.drive || '', phase: phase })));
     label.hidden = false;
   } else if (state && state.error) {
-    label.appendChild(tag('span', { class: 'bad' }, other + '上次扫描失败:' + state.error));
+    label.appendChild(tag('span', { class: 'bad' }, other + t('scan.failed') + state.error));
     label.hidden = false;
   } else if (state && state.finished_at) {
     const r = state.result || {};
-    const bits = [other + '扫完于 ' + fmtTime(state.finished_at)];
-    if (r.method) bits.push(r.method === 'mft' ? 'MFT' : '目录遍历');
-    if (r.duration_ms) bits.push((r.duration_ms / 1000).toFixed(1) + ' 秒');
+    const bits = [other + t('scan.doneAt') + fmtTime(state.finished_at)];
+    if (r.method) bits.push(r.method === 'mft' ? 'MFT' : t('base.walkMode'));
+    if (r.duration_ms) bits.push((r.duration_ms / 1000).toFixed(1) + t('scan.seconds'));
     label.appendChild(tag('span', { class: 'dim' }, bits.join(' · ')));
     label.hidden = false;
     // 这里不再重复退化原因。它已经落进快照,常驻在基线数字下面那一行 —— 那是
@@ -1403,22 +1489,22 @@ function paintSchedule(st) {
   const on = !!(st && st.exists && st.enabled);
 
   if (toggle) toggle.setAttribute('aria-pressed', on ? 'true' : 'false');
-  if (label) label.textContent = on ? '每天自动拍一次快照(已开)' : '每天自动拍一次快照';
+  if (label) label.textContent = on ? t('set.dailyOn') : t('set.daily');
   if (!detail) return;
 
   clear(detail);
   if (!st || !st.exists) {
     detail.appendChild(tag('span', { class: 'dim' },
-      '开了以后每天自动扫一次。时间轴上的实测数据靠它攒 —— 不开就只有你手动扫的那几天。'));
+      t('set.dailyWhy')));
     return;
   }
   const bits = [];
   if (st.schedule) bits.push(st.schedule);
-  if (st.next_run) bits.push('下次 ' + st.next_run);
-  if (st.last_run) bits.push('上次 ' + st.last_run);
-  if (st.last_result) bits.push('结果 ' + st.last_result);
+  if (st.next_run) bits.push(t('set.next') + st.next_run);
+  if (st.last_run) bits.push(t('set.last') + st.last_run);
+  if (st.last_result) bits.push(t('set.result') + st.last_result);
   detail.appendChild(tag('span', { class: st.enabled ? 'dim' : 'bad' },
-    (st.enabled ? '' : '已暂停。') + bits.join(' · ')));
+    (st.enabled ? '' : t('set.paused')) + bits.join(' · ')));
 }
 
 function paintSettingsInfo() {
@@ -1426,12 +1512,12 @@ function paintSettingsInfo() {
   if (!box || !S.status) return;
   clear(box);
   const priv = S.status.privileges || {};
-  box.appendChild(tag('b', null, priv.is_admin ? '管理员权限:有。' : '管理员权限:没有。'));
+  box.appendChild(tag('b', null, priv.is_admin ? t('set.adminYes') : t('set.adminNo')));
   box.appendChild(document.createTextNode(priv.is_admin
-    ? ' 走 MFT + 变更日志,全盘扫描几十秒,删除记录也能看到。'
-    : ' 只能退回目录遍历:更慢,而且看不到删除记录。用 strata.bat 启动会自动提权。'));
+    ? t('set.adminYesWhy')
+    : t('set.adminNoWhy')));
   box.appendChild(tag('div', { class: 'dim' },
-    `数据库 ${S.status.db_path}(${fmtBytes(S.status.db_bytes)})。不联网,不上传。`));
+    t('set.db', { path: S.status.db_path, bytes: fmtBytes(S.status.db_bytes) })));
 }
 
 async function loadSchedule() {
@@ -1474,7 +1560,7 @@ async function enterPath(path) {
     S.fade.clear();
     drawTreemap(false);
   } catch (err) {
-    banner(err.message);
+    banner({ text: err.message });     // 后端抛的原文,翻不了
   }
 }
 
@@ -1486,7 +1572,7 @@ async function loadDrive(drive, opts) {
   S.tlAnimated = false;
   renderDriveTabs();
   renderBaseline();
-  if (S.scan) setScanState(S.scan);   // "是哪个盘扫的"那个前缀要按新的 S.drive 重算
+  if (S.scan) setScanState(S.scan);   // 「是哪个盘扫的」那个前缀要按新的 S.drive 重算
 
   const jobs = [
     // 基线数字必须跟着重取。S.drives 原来只在开机时填一次,之后再没动过 ——
@@ -1503,7 +1589,7 @@ async function loadDrive(drive, opts) {
   ];
   const results = await Promise.allSettled(jobs);
   const failed = results.filter((r) => r.status === 'rejected');
-  if (failed.length) banner(failed[0].reason.message);
+  if (failed.length) banner({ text: failed[0].reason.message });
 
   // 上面已经用旧数据画过一次(先出东西比等着好),status 回来之后再画准的那一版
   renderDriveTabs();
@@ -1520,14 +1606,29 @@ function selectDrive(drive) {
   loadDrive(drive);
 }
 
-function banner(msg) {
+/* 横幅。传文案的键(切语言时能重画),或者 {text} 包一层原文
+ * (后端抛上来的报错,没法翻)。
+ *
+ * 存下最后一条:切语言时如果不重画,这行会一直停在旧语言上 —— 而它是
+ * 整屏最长的一段字,停在那儿最显眼。 */
+function banner(spec, vars) {
+  const box = el('banner');
+  if (!box) return;
+  S.banner = typeof spec === 'string' ? { key: spec, vars: vars } : spec;
+  paintBanner();
+}
+
+function paintBanner() {
   const box = el('banner');
   if (!box) return;
   clear(box);
+  if (!S.banner) { box.hidden = true; return; }
   box.hidden = false;
-  box.appendChild(tag('span', null, msg));
-  const close = tag('button', { class: 'banner-close', 'aria-label': '关闭' }, '×');
-  close.addEventListener('click', () => { box.hidden = true; });
+  const b = S.banner;
+  box.appendChild(tag('span', null, b.key ? t(b.key, b.vars) : b.text));
+  const close = tag('button', { class: 'banner-close', 'aria-label': t('ctx.close') }, '×');
+  // 关掉就是关掉:清空记录,别在切语言时又冒出来
+  close.addEventListener('click', () => { S.banner = null; box.hidden = true; });
   box.appendChild(close);
 }
 
@@ -1585,7 +1686,7 @@ function showCtx(rel, isDir, ev) {
   const parent = menu.querySelector('[data-act="parent"]');
   if (parent) parent.hidden = !rel;
   const open = menu.querySelector('[data-act="open"]');
-  if (open) open.textContent = ctx.isDir ? '在资源管理器打开' : '在资源管理器中定位';
+  if (open) open.textContent = ctx.isDir ? t('ctx.open') : t('ctx.locate');
 
   // 先显示再量尺寸,否则 offsetWidth 是 0
   menu.hidden = false;
@@ -1615,7 +1716,7 @@ async function copyPath(rel) {
   const text = fullPath(rel);
   try {
     await navigator.clipboard.writeText(text);
-    toast('已复制:' + text);
+    toast(t('ctx.copied') + text);
   } catch (err) {
     /* 剪贴板 API 要安全上下文,http://127.0.0.1 算安全上下文,
      * 但用户拒绝授权时仍会失败 —— 退回选中文本让人手动复制。 */
@@ -1626,9 +1727,9 @@ async function copyPath(rel) {
       const sel = window.getSelection();
       sel.removeAllRanges();
       sel.addRange(range);
-      toast('复制不了,已经选中路径,按 Ctrl+C', true);
+      toast(t('ctx.copyManual'), true);
     } else {
-      toast('复制失败:' + err.message, true);
+      toast(t('ctx.copyFailed') + err.message, true);
     }
   }
 }
@@ -1695,7 +1796,39 @@ function bindCtxMenu() {
   });
 }
 
+/* 切语言之后把所有「JS 画出来的东西」重画一遍。
+ *
+ * I18N.apply() 只管 HTML 里带 data-i18n 的静态节点,画布、时间轴、表格
+ * 都是这边拼出来的,它管不着。少调一个,那一块就停在旧语言上。
+ * 所以这里按渲染函数列全,而不是靠 apply() 顺带。
+ *
+ * drawTreemap(false):不播生长动画。切语言不是换数据,方块该待在原地。 */
+function repaintAll() {
+  paintBanner();
+  paintSpanButtons();
+  renderDriveTabs();
+  renderBaseline();
+  if (S.scan) setScanState(S.scan);
+  if (S.timeline) { renderTimeline(); renderLegend(); }
+  renderCrumbs();
+  if (S.tree) drawTreemap(false);
+  if (S.hotspots) renderHotspots();
+  renderDiff(S.diff);
+  renderChanges(S.changes);
+  if (S.schedule) paintSchedule(S.schedule);
+  paintSettingsInfo();
+}
+
 async function boot() {
+  I18N.apply();
+  I18N.onChange(repaintAll);
+  const langBtn = el('langBtn');
+  if (langBtn) {
+    langBtn.addEventListener('click', () => {
+      I18N.set(I18N.lang === 'zh' ? 'en' : 'zh');
+    });
+  }
+
   bindTreemap();
   bindCtxMenu();
   bindTimelineZoom();
@@ -1707,17 +1840,17 @@ async function boot() {
   try {
     S.status = await api('/api/status');
   } catch (err) {
-    banner('连不上后端:' + err.message);
+    banner('err.noBackend', { detail: err.message });
     return;
   }
 
   S.drives = S.status.drives || [];
   if (!S.drives.length) {
-    banner('没有找到可以扫的分区。这个工具需要 NTFS。');
+    banner('err.noDrives');
     return;
   }
   if (!(S.status.privileges || {}).is_admin) {
-    banner('不是管理员权限:读不了 MFT 和变更日志,只能退回目录遍历 —— 更慢,而且看不到删除记录。用 strata.bat 启动会自动提权。');
+    banner('err.notAdmin');
   }
   paintSettingsInfo();
 

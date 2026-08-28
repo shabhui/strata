@@ -1,9 +1,10 @@
 <!DOCTYPE html>
+<!-- lang 由 i18n.js 按当前语言改写,这里的值只是首屏渲染前的默认 -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata — 空间是什么时候被吃掉的</title>
+<title data-i18n="app.title">Strata — 空间是什么时候被吃掉的</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -12,16 +13,21 @@
   <div class="topbar-inner">
     <div class="brand">
       Strata
-      <small>面积是大小,颜色是年龄</small>
+      <small data-i18n="brand.tagline">面积是大小,颜色是年龄</small>
     </div>
-    <nav class="drive-tabs" id="driveTabs" role="tablist" aria-label="选择磁盘"></nav>
+    <nav class="drive-tabs" id="driveTabs" role="tablist"
+         data-i18n-label="nav.drives"></nav>
     <div class="topbar-actions">
       <div class="scan-state" id="scanState" hidden></div>
-      <button class="btn btn-primary" id="scanBtn">扫描本盘</button>
+      <!-- 语言按钮的文字是「另一种语言」:中文界面上写 English,反之写中文。
+           这样按钮本身就说明按下去会变成什么,不用图标也不用下拉。 -->
+      <button class="btn btn-ghost" id="langBtn" data-i18n="nav.lang"
+              data-i18n-title="nav.langTitle">English</button>
+      <button class="btn btn-primary" id="scanBtn" data-i18n="nav.scan">扫描本盘</button>
     </div>
   </div>
   <div class="baseline" id="baseline">
-    <span class="dim">读取中……</span>
+    <span class="dim" data-i18n="baseline.loading">读取中……</span>
   </div>
   <div class="baseline-note" id="baselineNote" hidden></div>
 </header>
@@ -32,63 +38,69 @@
 
   <div id="firstRun" hidden>
     <div class="notice">
-      <b>还没有扫描过。</b>
-      点右上角「扫描本盘」跑一次,几十秒就好。第一次扫完就能看到过去几个月的
-      变化 —— 靠的是现存文件的创建日期倒推,不用等着攒数据。
+      <b data-i18n="firstrun.title">还没有扫描过。</b>
+      <span data-i18n="firstrun.body"></span>
     </div>
   </div>
 
   <!-- 时间轴:这个工具的主张 -->
   <section class="section" id="timelineSection">
     <div class="section-head">
-      <h2>每日增减</h2>
-      <p>往右是今天。柱子朝上是增,朝下是减。</p>
+      <h2 data-i18n="tl.title">每日增减</h2>
+      <p data-i18n="tl.sub">往右是今天。柱子朝上是增,朝下是减。</p>
       <div class="right" id="timelineTotals"></div>
     </div>
     <div id="timelineNotice"></div>
-    <div class="empty-note" id="tlEmpty" hidden>还没有数据。扫一次就有了。</div>
+    <div class="empty-note" id="tlEmpty" hidden data-i18n="tl.empty">还没有数据。扫一次就有了。</div>
     <div class="tl-zoom" id="tlZoom" hidden>
-      <div class="tl-zoom-group" role="group" aria-label="缩放">
-        <button type="button" class="btn icon" id="tlZoomOut" title="缩小(-)" aria-label="缩小">−</button>
-        <button type="button" class="btn icon" id="tlZoomIn" title="放大(+)" aria-label="放大">+</button>
-        <button type="button" class="btn icon" id="tlReset" title="看全部(0)" aria-label="看全部">⤢</button>
+      <div class="tl-zoom-group" role="group" data-i18n-label="tl.zoomGroup">
+        <button type="button" class="btn icon" id="tlZoomOut"
+                data-i18n-title="tl.zoomOut" data-i18n-label="tl.zoomOut">−</button>
+        <button type="button" class="btn icon" id="tlZoomIn"
+                data-i18n-title="tl.zoomIn" data-i18n-label="tl.zoomIn">+</button>
+        <button type="button" class="btn icon" id="tlReset"
+                data-i18n-title="tl.showAll" data-i18n-label="tl.showAll">⤢</button>
       </div>
-      <div class="tl-zoom-group" role="group" aria-label="平移">
-        <button type="button" class="btn icon" id="tlLeft" title="往左(←)" aria-label="往左">‹</button>
-        <button type="button" class="btn icon" id="tlRight" title="往右(→)" aria-label="往右">›</button>
+      <div class="tl-zoom-group" role="group" data-i18n-label="tl.panGroup">
+        <button type="button" class="btn icon" id="tlLeft"
+                data-i18n-title="tl.panLeft" data-i18n-label="tl.panLeft">‹</button>
+        <button type="button" class="btn icon" id="tlRight"
+                data-i18n-title="tl.panRight" data-i18n-label="tl.panRight">›</button>
       </div>
-      <div class="tl-zoom-group" role="group" aria-label="最近">
+      <!-- 「7 天 / 14 天 / 30 天」带数字,由 app.js 按 data-span 填 -->
+      <div class="tl-zoom-group" role="group" data-i18n-label="tl.recentGroup">
         <button type="button" class="btn tiny" data-span="7">7 天</button>
         <button type="button" class="btn tiny" data-span="14">14 天</button>
         <button type="button" class="btn tiny" data-span="30">30 天</button>
       </div>
       <button type="button" class="btn tiny" id="tlLog" aria-pressed="false"
-              title="纵轴取对数。大小差一百倍的日子就都看得见了(L)">对数纵轴</button>
+              data-i18n="tl.log" data-i18n-title="tl.logTitle">对数纵轴</button>
       <span class="tl-range" id="tlRange" aria-live="polite"></span>
-      <span class="tl-hint">Ctrl + 滚轮缩放,按住拖动平移</span>
+      <span class="tl-hint" data-i18n="tl.hint">Ctrl + 滚轮缩放,按住拖动平移</span>
     </div>
     <div class="timeline-shell" id="tlShell" tabindex="0"
-         aria-label="每日空间增减时间轴,方向键平移,加号减号缩放,0 看全部">
-      <svg id="timeline" role="img" aria-label="每日空间增减时间轴"></svg>
+         data-i18n-label="tl.shellLabel">
+      <svg id="timeline" role="img" data-i18n-label="tl.svgLabel"></svg>
       <div class="tip" id="tlTip" role="tooltip"></div>
     </div>
     <p class="basis-note">
-      <span><i class="basis-swatch hatched"></i>回溯值:那天写入、现在还留在盘上的量。删掉的东西它看不见,所以只增不减,不等于那天的净变化。</span>
-      <span><i class="basis-swatch solid"></i>实测值:两次扫描的差,含删除,是真实净增减。</span>
+      <span><i class="basis-swatch hatched"></i><span data-i18n="basis.retro"></span></span>
+      <span><i class="basis-swatch solid"></i><span data-i18n="basis.measured"></span></span>
     </p>
   </section>
 
   <!-- 地层树图 -->
   <section class="section">
     <div class="section-head">
-      <h2>地层树图</h2>
-      <p>块的大小是占用,颜色是这一块里最新写入的时间。点色带只看某个年龄段。</p>
+      <h2 data-i18n="tm.title">地层树图</h2>
+      <p data-i18n="tm.sub">块的大小是占用,颜色是这一块里最新写入的时间。点色带只看某个年龄段。</p>
       <div class="right" id="treemapTotals"></div>
     </div>
-    <div class="legend" id="ageLegend" role="group" aria-label="按年龄筛选"></div>
+    <div class="legend" id="ageLegend" role="group" data-i18n-label="tm.legendLabel"></div>
     <div class="crumbs" id="crumbs"></div>
     <div class="treemap-shell">
-      <canvas id="treemap" height="440" role="img" aria-label="按大小和年龄排布的目录树图"></canvas>
+      <canvas id="treemap" height="440" role="img"
+              data-i18n-label="tm.canvasLabel"></canvas>
       <div class="tip" id="tmTip" role="tooltip"></div>
     </div>
   </section>
@@ -96,17 +108,17 @@
   <!-- 消失了什么 -->
   <section class="section" id="deletedSection" hidden>
     <div class="section-head">
-      <h2>消失了什么</h2>
-      <p>从 NTFS 变更日志里读出来的删除记录。时间戳看不到这些。</p>
+      <h2 data-i18n="del.title">消失了什么</h2>
+      <p data-i18n="del.sub">从 NTFS 变更日志里读出来的删除记录。时间戳看不到这些。</p>
       <div class="right" id="usnCoverage"></div>
     </div>
     <div id="usnNotice"></div>
     <table class="grid">
       <thead>
         <tr>
-          <th>路径</th>
-          <th style="width:110px">大小</th>
-          <th style="width:150px">时间</th>
+          <th data-i18n="clean.path">路径</th>
+          <th style="width:110px" data-i18n="grid.size">大小</th>
+          <th style="width:150px" data-i18n="grid.time">时间</th>
         </tr>
       </thead>
       <tbody id="deletedBody"></tbody>
@@ -116,7 +128,7 @@
   <!-- 两次扫描之间 -->
   <section class="section" id="diffSection" hidden>
     <div class="section-head">
-      <h2>最近两次扫描之间</h2>
+      <h2 data-i18n="diff.title">最近两次扫描之间</h2>
       <p id="diffRange"></p>
       <div class="right" id="diffNet"></div>
     </div>
@@ -124,13 +136,15 @@
     <div class="cols">
       <div>
         <table class="grid">
-          <thead><tr><th>长大了</th><th style="width:130px">变化</th></tr></thead>
+          <thead><tr><th data-i18n="diff.grew">长大了</th>
+            <th style="width:130px" data-i18n="diff.change">变化</th></tr></thead>
           <tbody id="grewBody"></tbody>
         </table>
       </div>
       <div>
         <table class="grid">
-          <thead><tr><th>缩小了</th><th style="width:130px">变化</th></tr></thead>
+          <thead><tr><th data-i18n="diff.shrank">缩小了</th>
+            <th style="width:130px" data-i18n="diff.change">变化</th></tr></thead>
           <tbody id="shrankBody"></tbody>
         </table>
       </div>
@@ -140,14 +154,16 @@
   <!-- 大户与可清理 -->
   <section class="section">
     <div class="section-head">
-      <h2>空间大户</h2>
-      <p>排除了父子重复,同一份空间只算一次。</p>
+      <h2 data-i18n="hot.title">空间大户</h2>
+      <p data-i18n="hot.sub">排除了父子重复,同一份空间只算一次。</p>
     </div>
     <div class="cols">
       <div>
         <table class="grid">
           <thead>
-            <tr><th>目录</th><th style="width:100px">占用</th><th style="width:96px">最近写入</th></tr>
+            <tr><th data-i18n="hot.dir">目录</th>
+              <th style="width:100px" data-i18n="hot.usage">占用</th>
+              <th style="width:96px" data-i18n="hot.lastWrite">最近写入</th></tr>
           </thead>
           <tbody id="bigDirsBody"></tbody>
         </table>
@@ -155,7 +171,9 @@
       <div>
         <table class="grid">
           <thead>
-            <tr><th>最近在长的</th><th style="width:100px">占用</th><th style="width:96px">最近写入</th></tr>
+            <tr><th data-i18n="hot.recent">最近在长的</th>
+              <th style="width:100px" data-i18n="hot.usage">占用</th>
+              <th style="width:96px" data-i18n="hot.lastWrite">最近写入</th></tr>
           </thead>
           <tbody id="recentBody"></tbody>
         </table>
@@ -165,22 +183,25 @@
 
   <section class="section">
     <div class="section-head">
-      <h2>可以清的</h2>
-      <p>只标出来,不动手。删不删由你决定。</p>
+      <h2 data-i18n="clean.title">可以清的</h2>
+      <p data-i18n="clean.sub">只标出来,不动手。删不删由你决定。</p>
       <div class="right" id="cleanupTotal"></div>
     </div>
     <div class="notice">
-      <b>安全等级</b>:<span class="tag safe">可删</span> 缓存类,删了会自动重建。
-      <span class="tag review">先看看</span> 可能有你要的东西。
-      <span class="tag careful">当心</span> 影响系统或软件功能,别手删。
+      <b data-i18n="clean.safetyHead">安全等级</b>:<span class="tag safe"
+        data-i18n="clean.safe">可删</span> <span data-i18n="clean.safeWhy"></span>
+      <span class="tag review" data-i18n="clean.review">先看看</span>
+      <span data-i18n="clean.reviewWhy"></span>
+      <span class="tag careful" data-i18n="clean.careful">当心</span>
+      <span data-i18n="clean.carefulWhy"></span>
     </div>
     <table class="grid">
       <thead>
         <tr>
-          <th>路径</th>
-          <th style="width:120px">类型</th>
-          <th style="width:100px">占用</th>
-          <th style="width:78px">等级</th>
+          <th data-i18n="clean.path">路径</th>
+          <th style="width:120px" data-i18n="clean.kind">类型</th>
+          <th style="width:100px" data-i18n="hot.usage">占用</th>
+          <th style="width:78px" data-i18n="clean.level">等级</th>
         </tr>
       </thead>
       <tbody id="cleanupBody"></tbody>
@@ -189,13 +210,13 @@
 
   <section class="section">
     <div class="section-head">
-      <h2>设置</h2>
-      <p>快照存在本机,不联网。</p>
+      <h2 data-i18n="set.title">设置</h2>
+      <p data-i18n="set.sub">快照存在本机,不联网。</p>
     </div>
     <div class="notice" id="settingsInfo"></div>
     <button class="toggle" id="scheduleToggle" aria-pressed="false">
       <span class="toggle-track"><span class="toggle-knob"></span></span>
-      <span id="scheduleLabel">每天自动拍一次快照</span>
+      <span id="scheduleLabel" data-i18n="set.daily">每天自动拍一次快照</span>
     </button>
     <p class="basis-note" id="scheduleDetail"></p>
   </section>
@@ -205,21 +226,19 @@
 <!-- 右键菜单。放在 main 外面,免得被各个 shell 的 overflow 裁掉 -->
 <div class="ctx" id="ctxMenu" role="menu" hidden>
   <div class="ctx-path" id="ctxPath"></div>
-  <button type="button" class="ctx-item" role="menuitem" data-act="open">
-    在资源管理器打开
-  </button>
-  <button type="button" class="ctx-item" role="menuitem" data-act="parent">
-    打开上一级目录
-  </button>
-  <button type="button" class="ctx-item" role="menuitem" data-act="copy">
-    复制完整路径
-  </button>
-  <button type="button" class="ctx-item" role="menuitem" data-act="enter">
-    在树图里进入这一层
-  </button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="open"
+          data-i18n="ctx.open">在资源管理器打开</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="parent"
+          data-i18n="ctx.parent">打开上一级目录</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="copy"
+          data-i18n="ctx.copy">复制完整路径</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="enter"
+          data-i18n="ctx.enter">在树图里进入这一层</button>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
+<!-- i18n 必须在 app.js 之前:app.js 里模块级的常量(比如 AGE_BANDS)会直接调 t() -->
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -1,5 +1,7 @@
 # Strata
 
+**中文** · [English](README.en.md)
+
 看清 C 盘和 D 盘的空间是**什么时候**、被**什么东西**吃掉的。
 
 磁盘分析工具满地都是,但它们只回答"现在谁占得多"。真正想知道的往往是另一个问题:**这三天多出来的 40 GB 是哪来的?** Strata 按天记录每个目录的体积变化,像地层一样一层层堆起来,所以你翻的是时间轴,不是文件树。
@@ -8,6 +10,7 @@
 - 本地网页界面,只监听 `127.0.0.1`,数据不出本机
 - 装好当天就能看到过去几天的增长(见下面的两层历史)
 - 直读 NTFS MFT,全盘扫描通常几秒;拿不到权限就自动退回普通遍历
+- 界面支持中英文。第一次打开跟着浏览器语言走,顶栏那个按钮(上面写的是「按下去会变成哪种语言」)可以改,改了会记住
 
 ## 两层历史
 
@@ -80,10 +83,6 @@ python tools/verify_exe.py       # 拉起 exe 跑一遍接口和路由
 - 回溯层依赖文件创建时间。有些安装器会重写这个时间戳,那部分增长的日期就是错的。
 - 回溯层记的是文件**现在**的大小,挂在它的**创建**日上。所以一个去年建、上周涨到 50 GB 的虚拟磁盘或数据库文件,那 50 GB 会全算在去年那天 —— 上周的柱子里看不到它。日志、镜像、pack 文件这类「原地长大」的东西都吃这个亏,只有实测层才看得见。
 - 未做验证:MFT / USN 代码路径的单元测试用的是合成样本,尚未在多种真实硬件上跑过。
-
-## English
-
-Strata answers *when* your Windows disk filled up, not just *what* is on it. It snapshots per-directory sizes daily and shows net change over time. Two data layers, never mixed in the UI: a **retro** layer that buckets existing files by creation date (works on day one, blind to deletions, a lower bound) and a **measured** layer that diffs consecutive snapshots (true net change). Reads the NTFS MFT directly when elevated, falls back to a normal walk otherwise. Pure Python standard library, no runtime dependencies, local web UI bound to `127.0.0.1` only.
 
 ## 许可
 

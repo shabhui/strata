@@ -12,39 +12,49 @@ from dataclasses import dataclass, field
 from .. import config
 from .paths import has_ancestor_in
 
-# 可清理候选:路径片段 → (标签, 说明, 安全等级)
+# 可清理候选:路径片段 → (文案代号, 安全等级)
+#
+# 这里只出代号,不出中文。标签和建议在 web/i18n.js 里按代号取 —— 代号是
+# clean.rule.<code>.label / .advice。
+#
+# 为什么后端不直接给中文:这两段字是整个界面上最长的一片文字,而且要跟着
+# 界面语言变。中文写在这儿的话,英文界面上「可以清的」整张表还是中文,
+# 而它旁边的表头、按钮全是英文 —— 一屏里两种语言,最难看的那种。
+# 后端不知道人在看哪种语言(而且切语言时不会重新请求),所以判断留在后端,
+# 措辞交给前端。
+#
 # 安全等级: 'safe' 删了只会丢缓存;'review' 可能有用,要看一眼;
 #           'careful' 删了可能影响功能
-CLEANUP_RULES: tuple[tuple[str, str, str, str], ...] = (
-    (r"windows\installer", "Windows 安装缓存", "卸载和修复程序时用到,删了某些软件无法卸载", "careful"),
-    (r"windows\winsxs", "组件存储", "系统组件的唯一副本,不能手删,只能用 DISM 清理", "careful"),
-    (r"windows\softwaredistribution\download", "更新下载缓存", "已安装的更新包,可以删", "safe"),
-    (r"windows\temp", "系统临时文件", "可以删", "safe"),
-    (r"$recycle.bin", "回收站", "确认里面没有要恢复的东西再清空", "review"),
-    (r"appdata\local\temp", "用户临时文件", "可以删,占用往往不小", "safe"),
-    (r"appdata\local\packages", "应用商店应用数据", "含应用的缓存和存档,逐个看", "review"),
-    (r"appdata\local\microsoft\windows\explorer", "缩略图缓存", "可以删,会自动重建", "safe"),
-    (r"appdata\local\pip\cache", "pip 缓存", "可以删,重装包时会重新下载", "safe"),
-    (r"appdata\local\npm-cache", "npm 缓存", "可以删", "safe"),
-    (r"appdata\roaming\npm-cache", "npm 缓存", "可以删", "safe"),
-    (r"appdata\local\yarn\cache", "yarn 缓存", "可以删", "safe"),
-    (r".cache", "工具缓存目录", "多数可以删,会自动重建", "safe"),
-    (r".gradle\caches", "Gradle 缓存", "可以删,下次构建重新下载", "safe"),
-    (r".m2\repository", "Maven 本地仓库", "可以删,下次构建重新下载", "review"),
-    (r".nuget\packages", "NuGet 缓存", "可以删", "safe"),
-    (r"node_modules", "Node 依赖", "项目可重装依赖,长期不动的项目值得清", "review"),
-    (r"__pycache__", "Python 字节码缓存", "可以删,会自动重建", "safe"),
-    (r"\target\debug", "Rust 调试产物", "可以删,重新编译即可", "safe"),
-    (r"\target\release", "Rust 发布产物", "可以删,重新编译即可", "safe"),
-    (r"steamapps\downloading", "Steam 下载暂存", "中断的下载残留,可以删", "safe"),
-    (r"steamapps\shadercache", "Steam 着色器缓存", "可以删,会自动重建", "safe"),
-    (r"steamapps\workshop", "Steam 创意工坊", "订阅的模组内容,按需取舍", "review"),
-    (r"nvidia corporation\downloader", "NVIDIA 驱动下载缓存", "可以删", "safe"),
-    (r"crashdumps", "崩溃转储", "排查过就可以删", "safe"),
-    (r"windows\minidump", "蓝屏小转储", "排查过就可以删", "safe"),
-    (r"hiberfil.sys", "休眠文件", "关掉休眠可释放,等同于内存大小", "careful"),
-    (r"pagefile.sys", "虚拟内存页面文件", "由系统管理,不要手删", "careful"),
-    (r"swapfile.sys", "交换文件", "由系统管理,不要手删", "careful"),
+CLEANUP_RULES: tuple[tuple[str, str, str], ...] = (
+    (r"windows\installer", "winInstaller", "careful"),
+    (r"windows\winsxs", "winSxs", "careful"),
+    (r"windows\softwaredistribution\download", "winUpdate", "safe"),
+    (r"windows\temp", "winTemp", "safe"),
+    (r"$recycle.bin", "recycleBin", "review"),
+    (r"appdata\local\temp", "userTemp", "safe"),
+    (r"appdata\local\packages", "storeApps", "review"),
+    (r"appdata\local\microsoft\windows\explorer", "thumbnails", "safe"),
+    (r"appdata\local\pip\cache", "pipCache", "safe"),
+    (r"appdata\local\npm-cache", "npmCache", "safe"),
+    (r"appdata\roaming\npm-cache", "npmCache", "safe"),
+    (r"appdata\local\yarn\cache", "yarnCache", "safe"),
+    (r".cache", "toolCache", "safe"),
+    (r".gradle\caches", "gradleCache", "safe"),
+    (r".m2\repository", "mavenRepo", "review"),
+    (r".nuget\packages", "nugetCache", "safe"),
+    (r"node_modules", "nodeModules", "review"),
+    (r"__pycache__", "pycache", "safe"),
+    (r"\target\debug", "rustDebug", "safe"),
+    (r"\target\release", "rustRelease", "safe"),
+    (r"steamapps\downloading", "steamPartial", "safe"),
+    (r"steamapps\shadercache", "steamShaders", "safe"),
+    (r"steamapps\workshop", "steamWorkshop", "review"),
+    (r"nvidia corporation\downloader", "nvidiaDownload", "safe"),
+    (r"crashdumps", "crashDumps", "safe"),
+    (r"windows\minidump", "miniDumps", "safe"),
+    (r"hiberfil.sys", "hiberfil", "careful"),
+    (r"pagefile.sys", "pagefile", "careful"),
+    (r"swapfile.sys", "swapfile", "careful"),
 )
 
 
@@ -54,8 +64,7 @@ class Hotspot:
     bytes: int
     files: int
     newest: float | None = None
-    label: str | None = None
-    advice: str | None = None
+    rule: str | None = None      # 命中的清理规则代号,见 CLEANUP_RULES
     safety: str | None = None
 
     def as_dict(self) -> dict:
@@ -64,8 +73,7 @@ class Hotspot:
             "bytes": self.bytes,
             "files": self.files,
             "newest": self.newest,
-            "label": self.label,
-            "advice": self.advice,
+            "rule": self.rule,
             "safety": self.safety,
         }
 
@@ -86,12 +94,12 @@ class GrowthSpot:
         }
 
 
-def classify_path(path: str) -> tuple[str, str, str] | None:
-    """路径命中清理规则时返回 (标签, 说明, 安全等级)。"""
+def classify_path(path: str) -> tuple[str, str] | None:
+    """路径命中清理规则时返回 (文案代号, 安全等级)。"""
     lowered = path.lower()
-    for needle, label, advice, safety in CLEANUP_RULES:
+    for needle, code, safety in CLEANUP_RULES:
         if needle in lowered:
-            return label, advice, safety
+            return code, safety
     return None
 
 
@@ -129,9 +137,8 @@ def biggest_dirs(
                 bytes=int(row["bytes"]),
                 files=int(row["files"]),
                 newest=row["newest_mtime"],
-                label=hint[0] if hint else None,
-                advice=hint[1] if hint else None,
-                safety=hint[2] if hint else None,
+                rule=hint[0] if hint else None,
+                safety=hint[1] if hint else None,
             )
         )
         if len(picked) >= limit:
@@ -159,9 +166,8 @@ def biggest_files(
                 bytes=int(row["bytes"]),
                 files=1,
                 newest=row["mtime"],
-                label=hint[0] if hint else None,
-                advice=hint[1] if hint else None,
-                safety=hint[2] if hint else None,
+                rule=hint[0] if hint else None,
+                safety=hint[1] if hint else None,
             )
         )
     return out
@@ -245,9 +251,8 @@ def cleanup_candidates(
             bytes=int(row["bytes"]),
             files=int(row["files"]),
             newest=row["newest_mtime"],
-            label=hint[0],
-            advice=hint[1],
-            safety=hint[2],
+            rule=hint[0],
+            safety=hint[1],
         )
 
     for row in conn.execute(
@@ -269,9 +274,8 @@ def cleanup_candidates(
             bytes=int(row["bytes"]),
             files=1,
             newest=row["mtime"],
-            label=hint[0],
-            advice=hint[1],
-            safety=hint[2],
+            rule=hint[0],
+            safety=hint[1],
         )
 
     out = sorted(found.values(), key=lambda h: h.bytes, reverse=True)
@@ -281,13 +285,16 @@ def cleanup_candidates(
 def age_profile(conn: sqlite3.Connection, snapshot_id: int, *, now: float | None = None) -> list[dict]:
     """按年龄段汇总占用,给树图的年龄图例用。"""
     now = time.time() if now is None else now
+    # 只有 key 和上界。文案不在这儿 —— 界面上那几个字是 web/app.js 的
+    # AGE_BANDS 按 key 出的(它还要配色),后端再给一份中文标签没人读,
+    # 只会让下一个人以为改这里就能改界面。
     bands = (
-        ("today", 1, "今天"),
-        ("week", 7, "本周"),
-        ("month", 30, "本月"),
-        ("quarter", 90, "三个月内"),
-        ("year", 365, "一年内"),
-        ("older", None, "更早"),
+        ("today", 1),
+        ("week", 7),
+        ("month", 30),
+        ("quarter", 90),
+        ("year", 365),
+        ("older", None),
     )
 
     rows = list(
@@ -298,7 +305,7 @@ def age_profile(conn: sqlite3.Connection, snapshot_id: int, *, now: float | None
         )
     )
 
-    totals = {key: [0, 0] for key, _, _ in bands}
+    totals = {key: [0, 0] for key, _ in bands}
     for row in rows:
         # 取当天正午,而不是午夜:落在分界上的那天不会因为几小时的偏差被算到
         # 相邻的年龄段里。这里一次请求要转上千个日期,strptime 太慢,见 config。
@@ -306,14 +313,14 @@ def age_profile(conn: sqlite3.Connection, snapshot_id: int, *, now: float | None
         if ts is None:
             continue
         age_days = (now - ts) / 86400
-        for key, limit, _label in bands:
+        for key, limit in bands:
             if limit is None or age_days <= limit:
                 totals[key][0] += int(row["b"] or 0)
                 totals[key][1] += int(row["f"] or 0)
                 break
 
     return [
-        {"key": key, "label": label, "max_days": limit,
+        {"key": key, "max_days": limit,
          "bytes": totals[key][0], "files": totals[key][1]}
-        for key, limit, label in bands
+        for key, limit in bands
     ]

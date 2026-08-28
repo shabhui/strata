@@ -330,9 +330,13 @@ def check_serve(exe: Path) -> bool:
         log("  OK  服务起来了")
 
         ok = True
-        # 界面三件套:HTML/JS/CSS 都得从 _MEIPASS 里发得出来
+        # 界面四件套:HTML/JS/CSS/文案 都得从 _MEIPASS 里发得出来。
+        # i18n.js 单独列一条:它 404 的话 app.js 里的 t() 全炸,页面一片空白,
+        # 而上面三个照样 200 —— 只验三个的话这种全白能过关。
+        # 判据用 'STRINGS' 而不是 'function':i18n.js 就是一张表,
+        # 换成箭头函数写法就没有 function 这个词了。
         for path, probe in (("/", "<html"), ("/app.js", "function"),
-                            ("/app.css", "{")):
+                            ("/app.css", "{"), ("/i18n.js", "strings")):
             try:
                 with urllib.request.urlopen(base + path, timeout=5) as r:
                     body = r.read().decode("utf-8", "replace")

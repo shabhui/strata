@@ -22,8 +22,11 @@ a = Analysis(
     pathex=[str(SRC)],
     binaries=[],
     # 非 Python 文件 PyInstaller 不会自己发现,必须显式带上,漏一个就是运行到
-    # 那条路径才崩。src 树里的非 .py 文件一共就这两处(web/ 三个文件 +
+    # 那条路径才崩。src 树里的非 .py 文件一共就这两处(web/ 整个目录 +
     # schema.sql),目标路径要和 config.bundle_dir() 拼出来的一致。
+    #
+    # web/ 是整个目录一起带,不是一个个文件列 —— 所以往里加文件(比如 i18n.js)
+    # 不用改这儿。列文件的写法早晚会漏一个,而漏了要到打包出来点开页面才发现。
     datas=[
         (str(SRC / "strata" / "web"), "web"),
         (str(SRC / "strata" / "store" / "schema.sql"), "store"),

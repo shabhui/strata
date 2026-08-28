@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
+from .. import config
+
 GREW = "grew"
 SHRANK = "shrank"
 APPEARED = "appeared"
@@ -43,7 +45,9 @@ class SnapshotDiff:
     after_bytes: int
     dir_deltas: list[Delta] = field(default_factory=list)
     file_deltas: list[Delta] = field(default_factory=list)
-    caveats: list[str] = field(default_factory=list)
+    # 每条形如 {"code": "demoted", "vars": {...}};vars 可省。
+    # 出代号不出中文的原因见 compare_snapshots 里的注释。
+    caveats: list[dict] = field(default_factory=list)
 
     @property
     def net(self) -> int:
@@ -143,22 +147,30 @@ def diff_snapshots(
         before, after = after, before
         before_id, after_id = after_id, before_id
 
-    caveats: list[str] = []
+    # 口径说明出代号 + 参数,措辞在 web/i18n.js(键是 diff.caveat.<代号>)。
+    # 后端不知道人在看哪种语言,切语言时也不会重新请求,所以中文不能写在这儿。
+    caveats: list[dict] = []
     demoted = [
         row["id"]
         for row in (before, after)
         if "[已降级]" in (row["note"] or "")
     ]
     if demoted:
-        caveats.append(
-            f"参与对比的快照中有 {len(demoted)} 个已降级为粗粒度,"
-            f"深度超过 3 层且小于 64 MB 的目录不参与比较"
-        )
+        # 深度和字节数从 config 取,别写死在文案里 —— 原来这两个数字是手写的
+        # 「3 层」「64 MB」,改了 config 就变成一句错话,而且没有测试能发现。
+        caveats.append({
+            "code": "demoted",
+            "vars": {
+                "n": len(demoted),
+                "depth": config.DEMOTE_DIR_MAX_DEPTH,
+                "bytes": config.DEMOTE_DIR_MIN_BYTES,
+            },
+        })
     if before["method"] != after["method"]:
-        caveats.append(
-            f"两次扫描方式不同({before['method']} vs {after['method']}),"
-            f"硬链接与占盘大小的算法有差异,增减值仅供参考"
-        )
+        caveats.append({
+            "code": "mixedMethod",
+            "vars": {"before": before["method"], "after": after["method"]},
+        })
 
     dir_deltas = _deltas(
         _dirs(conn, before_id, max_depth),
@@ -170,16 +182,13 @@ def diff_snapshots(
     after_files = _files(conn, after_id)
     if not before_files and not after_files:
         file_deltas: list[Delta] = []
-        caveats.append("两个快照都没有文件明细(已降级),只能对比目录")
+        caveats.append({"code": "noFilesEitherSide"})
     elif not before_files or not after_files:
         file_deltas = []
-        caveats.append("其中一个快照的文件明细已被降级清除,跳过文件级对比")
+        caveats.append({"code": "noFilesOneSide"})
     else:
         file_deltas = _deltas(before_files, after_files, min_bytes=min_bytes)
-        caveats.append(
-            "文件明细只收录超过阈值的文件,"
-            "「新出现」也可能是原本就在、只是这次才超过阈值"
-        )
+        caveats.append({"code": "fileThreshold"})
 
     return SnapshotDiff(
         drive=before["drive"],

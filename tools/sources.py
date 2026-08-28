@@ -12,7 +12,7 @@
 警告是一回事。内容变了才是真的要重打。
 
 为什么归一化换行:仓库里是 worktree CRLF / index LF。.py 编成字节码之后
-CRLF 和 LF 没有区别,web/ 那三个文件的换行也不影响功能。按原始字节算的话,
+CRLF 和 LF 没有区别,web/ 那几个文件的换行也不影响功能。按原始字节算的话,
 git 重写一遍换行就报「过期」,又是误报。
 """
 
@@ -27,7 +27,7 @@ FINGERPRINT = ROOT / "dist" / "Strata.sources.json"
 
 # 影响产物的东西,和 strata.spec 里 datas/入口那几项对齐:
 #   entry.py        入口
-#   src/strata/**   全部代码 + web/ 三件套 + schema.sql
+#   src/strata/**   全部代码 + web/ 整个目录 + schema.sql
 #   strata.manifest 嵌进 exe 的 manifest(提权、长路径)
 #   strata.spec     打包配置本身(datas 漏一项就是运行到那儿才崩)
 # 不含 build_exe.py / verify_exe.py:那是工具,不进产物。
