@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,6 +173,142 @@ class NonzeroExitTest(unittest.TestCase):
     def test_zero_with_good_report_passes(self):
         # 对照组:同一份输出,返回码 0 就该通过 —— 否则上面那条只是恒假。
         self.assertTrue(self.check(DOCTOR, 0))
+
+
+class SourceFingerprintTest(unittest.TestCase):
+    """源码指纹:回答「这个 exe 是哪版代码打出来的」。
+
+    不加这个的话,整套验证能全过而 exe 是三天前的 —— 报告没说假话,只是说的
+    不是你以为的那个二进制。
+    """
+
+    def setUp(self):
+        import sources
+        self.S = sources
+        self.tmp = Path(tempfile.mkdtemp(prefix="tc-fp-")) / "fp.json"
+        self.addCleanup(shutil.rmtree, self.tmp.parent, ignore_errors=True)
+
+    def test_covers_everything_the_spec_bundles(self):
+        # 漏了哪一类文件,那类文件改了就不会被发现。
+        rels = set(self.S.fingerprint())
+        self.assertIn("tools/entry.py", rels)               # 入口
+        self.assertIn("tools/strata.spec", rels)            # datas 漏一项就崩
+        self.assertIn("tools/strata.manifest", rels)        # 提权靠它
+        self.assertIn("src/strata/web/app.js", rels)        # datas 带的
+        self.assertIn("src/strata/store/schema.sql", rels)  # datas 带的
+        self.assertIn("src/strata/__main__.py", rels)
+
+    def test_no_pyc_in_the_fingerprint(self):
+        # .pyc 会跟着解释器版本变,进指纹就会无缘无故报过期。
+        self.assertFalse([r for r in self.S.fingerprint()
+                          if r.endswith((".pyc", ".pyo")) or "__pycache__" in r])
+
+    def test_no_fingerprint_file_is_missing_not_stale(self):
+        # 分清「验不了」和「验过了不对」。当成 stale 会让人白重打一次包。
+        self.assertEqual(self.S.compare(self.tmp)[0], "missing")
+
+    def test_unchanged_tree_is_same(self):
+        self.S.write(self.tmp)
+        self.assertEqual(self.S.compare(self.tmp)[0], "same")
+
+    def test_changed_content_is_stale(self):
+        self.S.write(self.tmp)
+        was = json.loads(self.tmp.read_text(encoding="utf-8"))
+        was["src/strata/web/app.js"] = "0" * 16
+        self.tmp.write_text(json.dumps(was), encoding="utf-8")
+        verdict, diff = self.S.compare(self.tmp)
+        self.assertEqual(verdict, "stale")
+        self.assertIn("改了 src/strata/web/app.js", diff)
+
+    def test_deleted_file_is_stale(self):
+        self.S.write(self.tmp)
+        was = json.loads(self.tmp.read_text(encoding="utf-8"))
+        was["src/strata/nonexistent.py"] = "abc"
+        self.tmp.write_text(json.dumps(was), encoding="utf-8")
+        verdict, diff = self.S.compare(self.tmp)
+        self.assertEqual(verdict, "stale")
+        self.assertIn("删掉 src/strata/nonexistent.py", diff)
+
+    def test_added_file_is_stale(self):
+        self.S.write(self.tmp)
+        was = json.loads(self.tmp.read_text(encoding="utf-8"))
+        was.pop("src/strata/__main__.py")
+        self.tmp.write_text(json.dumps(was), encoding="utf-8")
+        verdict, diff = self.S.compare(self.tmp)
+        self.assertEqual(verdict, "stale")
+        self.assertIn("新增 src/strata/__main__.py", diff)
+
+    def test_line_endings_do_not_count(self):
+        # 仓库是 worktree CRLF / index LF。按原始字节算的话,git 重写一遍换行
+        # 就报过期 —— 而误报久了人就不看警告了。
+        src = "def f():\r\n    return 1\r\n"
+        a = Path(self.tmp.parent, "a.py"); a.write_text(src, newline="")
+        b = Path(self.tmp.parent, "b.py"); b.write_text(src.replace("\r\n", "\n"), newline="")
+        self.assertEqual(self.S.digest_of(a), self.S.digest_of(b))
+
+    def test_content_change_does_count(self):
+        # 对照组:上面那条不能是「什么都算一样」。
+        a = Path(self.tmp.parent, "c.py"); a.write_text("return 1\n", newline="")
+        b = Path(self.tmp.parent, "d.py"); b.write_text("return 2\n", newline="")
+        self.assertNotEqual(self.S.digest_of(a), self.S.digest_of(b))
+
+    def test_unreadable_fingerprint_is_missing_not_crash(self):
+        # 文件坏了要退回「验不了」,不能让验证脚本自己炸在这儿。
+        self.tmp.parent.mkdir(parents=True, exist_ok=True)
+        self.tmp.write_text("{ 这不是 json", encoding="utf-8")
+        self.assertEqual(self.S.compare(self.tmp)[0], "missing")
+
+
+class CaveatTest(unittest.TestCase):
+    """「没验上」不能被末尾那句「可以发出去了」盖过去。
+
+    警告埋在几十行输出中间等于没有 —— 人只看最后一行。
+    """
+
+    def setUp(self):
+        self.real = list(V.caveats)
+        V.caveats.clear()
+        self.addCleanup(lambda: (V.caveats.clear(), V.caveats.extend(self.real)))
+
+    def test_missing_fingerprint_records_a_caveat(self):
+        import sources
+        real_compare, real_log = sources.compare, V.log
+        V.log = lambda m: None
+        sources.compare = lambda *a, **kw: ("missing", [])
+        try:
+            if not V.RELEASE_EXE.exists():
+                self.skipTest("没有 dist/Strata.exe")
+            self.assertTrue(V.check_fresh())      # 不算失败
+            self.assertTrue(V.caveats)            # 但也不算验过了
+        finally:
+            sources.compare, V.log = real_compare, real_log
+
+    def test_match_records_nothing(self):
+        import sources
+        real_compare, real_log = sources.compare, V.log
+        V.log = lambda m: None
+        sources.compare = lambda *a, **kw: ("same", [])
+        try:
+            if not V.RELEASE_EXE.exists():
+                self.skipTest("没有 dist/Strata.exe")
+            self.assertTrue(V.check_fresh())
+            self.assertFalse(V.caveats)
+        finally:
+            sources.compare, V.log = real_compare, real_log
+
+    def test_stale_is_a_failure_not_a_caveat(self):
+        # 过期是明确的失败,不是「没验上」—— 别降级成一条提示。
+        import sources
+        real_compare, real_log = sources.compare, V.log
+        V.log = lambda m: None
+        sources.compare = lambda *a, **kw: ("stale", ["改了 src/strata/x.py"])
+        try:
+            if not V.RELEASE_EXE.exists():
+                self.skipTest("没有 dist/Strata.exe")
+            self.assertFalse(V.check_fresh())
+            self.assertFalse(V.caveats)
+        finally:
+            sources.compare, V.log = real_compare, real_log
 
 
 if __name__ == "__main__":

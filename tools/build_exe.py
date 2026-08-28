@@ -120,8 +120,16 @@ def main() -> int:
     if not args.keep_build:
         shutil.rmtree(ROOT / "build", ignore_errors=True)
 
+    # 记下这个 exe 是从哪版代码打出来的。没有这个,verify_exe 只能验「这个文件
+    # 能跑」,验不了「这个文件是不是当前代码」—— 改了 src/ 忘了重打,它照样
+    # 报全部通过。
+    sys.path.insert(0, str(ROOT / "tools"))
+    import sources
+    fp = sources.write()
+
     print("\n" + "-" * 52)
     print(f"好了:{exe}")
+    print(f"源码指纹:{len(fp)} 个文件 → {sources.FINGERPRINT.name}")
     print(f"大小:{human_size(exe.stat().st_size)},耗时 {elapsed:.0f}s")
     print()
     print("这一个文件拷给谁都能用,对方不用装 Python。")

@@ -38,9 +38,54 @@ def log(msg: str) -> None:
     sys.stdout.flush()
 
 
+# 「没验成」和「验过了没问题」是两件事。攒在这儿,最后一行别说满话 ——
+# 警告埋在几十行输出中间等于没有,末尾那句「可以发出去了」才是人看的。
+caveats: list[str] = []
+
+
+def check_fresh() -> bool:
+    """dist/Strata.exe 是不是当前代码打出来的。
+
+    下面几组验的都是「这个 exe 能跑」,没有一组能回答「这个 exe 是哪版代码」。
+    改了 src/ 忘了重新打包,整套照样通过,末尾照样打「可以发出去了」—— 报告
+    是真的,只是说的是一个旧二进制。和刚修掉的那条界面目录检查同一类毛病:
+    检查过了,但过的不是你以为的那件事。
+    """
+    log("\n[1/6] 发布 exe 和当前代码对不对得上")
+    if not RELEASE_EXE.exists():
+        log(f"  跳过:{RELEASE_EXE.name} 不在")
+        return False
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    import sources
+
+    verdict, diff = sources.compare()
+    if verdict == "missing":
+        # 上一次打包的时候还没有这套机制。不算失败 —— 但也不能装作验过了,
+        # 所以记一条 caveat,末尾那句话会跟着改。
+        log("  ?? 没有源码指纹(dist/Strata.sources.json 不在)")
+        log("     这个 exe 打包时还没有这套记录,验不了它对应哪版代码。")
+        log("     重新打一次包就有了:python tools/build_exe.py")
+        for line in diff:
+            log(f"     {line}")
+        caveats.append("没验出 exe 对应哪版代码(缺源码指纹)")
+        return True
+    if verdict == "stale":
+        log(f"  BAD exe 比代码旧,有 {len(diff)} 处不一致 —— 得重新打包")
+        for line in diff[:12]:
+            log(f"       {line}")
+        if len(diff) > 12:
+            log(f"       …… 还有 {len(diff) - 12} 处")
+        log("     下面几组验的会是这个旧 exe,通过了也不代表当前代码没问题。")
+        return False
+    log(f"  OK  一致({len(sources.fingerprint())} 个文件,"
+        f"exe {RELEASE_EXE.stat().st_size / 1048576:.1f} MB)")
+    return True
+
+
 def check_manifest() -> bool:
     """发布 exe 里该有的两样东西:强制提权、长路径。"""
-    log("\n[1/5] 发布 exe 的 manifest")
+    log("\n[2/6] 发布 exe 的 manifest")
     if not RELEASE_EXE.exists():
         log(f"  跳过:{RELEASE_EXE} 不在,先跑 tools/build_exe.py")
         return False
@@ -63,7 +108,7 @@ def check_manifest() -> bool:
 
 def build_test_exe(workdir: Path) -> Path | None:
     """用发布配置打一个不要求提权的副本,只为了能在普通权限下跑。"""
-    log("\n[2/5] 打一个不提权的副本用来验代码路径")
+    log("\n[3/6] 打一个不提权的副本用来验代码路径")
     spec_src = (ROOT / "tools" / "strata.spec").read_text(encoding="utf-8")
     # 只动这两处:去掉 UAC 要求和自定义 manifest,其余(datas、hiddenimports、
     # excludes)和发布配置完全一致,不然验的就不是同一个东西了。
@@ -141,7 +186,7 @@ def run(exe: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProces
 
 def check_doctor(exe: Path) -> bool:
     """doctor 会把界面目录、数据库路径都打出来,一条命令能验好几件事。"""
-    log("\n[3/5] 冻结后的 doctor")
+    log("\n[4/6] 冻结后的 doctor")
     try:
         proc = run(exe, "doctor")
     except subprocess.TimeoutExpired:
@@ -201,7 +246,7 @@ def check_doctor(exe: Path) -> bool:
 
 def check_subcommands(exe: Path) -> bool:
     """每个子命令都会 import 一批模块,漏打包的话这里就崩。"""
-    log("\n[4/5] 各子命令的 import(冻结后最容易漏这个)")
+    log("\n[5/6] 各子命令的 import(冻结后最容易漏这个)")
     ok = True
     for args, expect in (
         # 探测串一律用 ASCII:中文会被 argparse 按宽度折行,用它当判据容易误报。
@@ -255,7 +300,7 @@ def kill_tree(proc: subprocess.Popen) -> None:
 
 def check_serve(exe: Path) -> bool:
     """真起一次服务,把界面和各个接口拉下来看。"""
-    log("\n[5/5] 冻结后的 serve(真起服务)")
+    log("\n[6/6] 冻结后的 serve(真起服务)")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     # 二进制管道 + 自己解:进程提前退的时候要读它的输出,那正是最需要看清
     # 中文的时刻(端口占用、库锁住之类都是中文提示)。
@@ -348,7 +393,7 @@ def main() -> int:
     log("验证 Strata 打包产物")
     log("=" * 52)
 
-    results = {"manifest": check_manifest()}
+    results = {"fresh": check_fresh(), "manifest": check_manifest()}
     workdir = Path(tempfile.mkdtemp(prefix="tc-verify-"))
     try:
         exe = build_test_exe(workdir)
@@ -372,6 +417,14 @@ def main() -> int:
     if bad:
         log(f"\n有问题:{', '.join(bad)}")
         return 1
+    if caveats:
+        # 每一条都通过了,但有东西根本没验上。说「全部通过」不算撒谎,
+        # 说「可以发出去了」就过头了。
+        log("\n每条检查都过了,但有没验上的:")
+        for line in caveats:
+            log(f"  ?? {line}")
+        log("\n先把上面这条解决掉,再决定要不要发出去。")
+        return 0
     log("\n全部通过。dist/Strata.exe 可以发出去了。")
     return 0
 
