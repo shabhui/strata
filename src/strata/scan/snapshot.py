@@ -206,6 +206,13 @@ def scan_drive(
     file_rows = tree.select_files(entries, now=taken_at)
     dir_count = sum(1 for e in entries if e.is_dir)
 
+    # 退化原因也要落库,不能只放在返回值里。退回目录遍历意味着这份数据的口径
+    # 变了(硬链接重复计数、算的是逻辑大小),而这个前提在快照活着的整段时间里
+    # 都成立 —— 原来它只在扫描那一刻显示,刷新页面就没了,后来看这份数据的人
+    # 不知道数字是怎么来的。note 已经是自由文本,也已经透给了前端。
+    # 原因排在警告前面:先说为什么退,再说退了之后数字有什么变化。
+    note_parts = ([fallback_reason] if fallback_reason else []) + warnings
+
     snap = db.Snapshot(
         drive=drive,
         taken_at=taken_at,
@@ -217,7 +224,7 @@ def scan_drive(
         file_count=file_count,
         dir_count=dir_count,
         complete=False,
-        note="; ".join(warnings) if warnings else None,
+        note="; ".join(note_parts) if note_parts else None,
     )
 
     conn.execute("BEGIN")

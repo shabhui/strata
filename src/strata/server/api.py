@@ -150,8 +150,8 @@ def get_timeline(conn: sqlite3.Connection, params: dict) -> dict:
         "usn_coverage": changes_mod.usn_coverage(conn, drive),
         # 界面必须把这两层的差别讲清楚,不能让人以为回溯值是实测的
         "notes": {
-            "retro": "回溯:按现存文件的创建日期推算,看不到已经删掉的东西,"
-                     "是净新增的下界。",
+            "retro": "回溯:那天写入、现在还留在盘上的量。删掉的东西看不见,"
+                     "所以只增不减,不等于那天的净变化。",
             "measured": "实测:两次扫描的差值,含删除,是真实净增减。",
         },
     }

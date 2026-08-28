@@ -8,8 +8,10 @@ BaseHTTPRequestHandler 默认走 HTTP/1.0,一个请求一个连接,一个连接�
 
 from __future__ import annotations
 
+import http.client
 import socket
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 
@@ -144,6 +146,63 @@ class UnreadBodyTest(KeepAliveFixture):
     @staticmethod
     def _count_responses(raw: bytes) -> int:
         return raw.count(b"HTTP/1.1 ") + raw.count(b"HTTP/1.0 ")
+
+
+class LingeringCloseTest(KeepAliveFixture):
+    """拒掉请求之后,那个拒绝本身要真的送到客户端手里。
+
+    Windows 上 closesocket() 碰到接收缓冲里还有没读走的数据,发的是 RST;RST 会让
+    对端把已经收到、还没读的字节一起丢掉 —— 也就是我们刚发出去的 413。随机跑整个
+    测试集时偶发 ConnectionAbortedError,概率约 1/12,就是这件事。
+    """
+
+    ATTEMPTS = 10
+    BODY = 4 << 20        # 小的请求体挤不出这个现象:0/1 KB 时怎么跑都是对的
+
+    def _reject_with_unread_body(self) -> str:
+        """声明一个超限的 Content-Length,真的发一大坨过去,看能不能收到 413。"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.putrequest("POST", "/api/reveal")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Origin", f"http://127.0.0.1:{self.port}")
+            conn.putheader("Content-Length", str(4 << 30))
+            conn.endheaders()
+            conn.send(b"x" * self.BODY)     # 服务端判定读不起,一个字节都不会读
+            resp = conn.getresponse()
+            resp.read()
+            return str(resp.status)
+        except OSError as exc:
+            return type(exc).__name__
+        finally:
+            conn.close()
+
+    def test_the_refusal_survives_an_unread_body(self) -> None:
+        """跑多次:这是个竞态,单次不稳定,连续全中才说明收尾管住了。"""
+        got = [self._reject_with_unread_body() for _ in range(self.ATTEMPTS)]
+        self.assertEqual(got, ["413"] * self.ATTEMPTS)
+
+    def test_the_linger_lets_go_as_soon_as_the_peer_is_done(self) -> None:
+        """对端一关就收手,不能空转到超时为止。
+
+        收尾是在处理线程里跑的,而 socketserver 一个连接一个线程。读到空还继续
+        读的话,每个被拒的请求都会有一个线程原地空转半秒 —— 客户端看不出来
+        (它的响应早拿到了),但线程堆着。所以这里量的是线程数,不是响应时间。
+        """
+        base = threading.active_count()
+        for _ in range(self.ATTEMPTS):
+            self._reject_with_unread_body()
+
+        # 线程退出是异步的,得给一点时间。但预算必须远小于 LINGER_SECONDS,
+        # 不然空转的那半秒正好等完,反而看不出区别 —— 正常路径读到空就跳出,
+        # 线程立刻退,五分之一的预算绰绰有余。
+        deadline = time.monotonic() + Handler.LINGER_SECONDS / 5
+        while threading.active_count() > base and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertLessEqual(
+            threading.active_count(), base,
+            f"{self.ATTEMPTS} 个被拒的请求过后还有线程没退",
+        )
 
 
 if __name__ == "__main__":

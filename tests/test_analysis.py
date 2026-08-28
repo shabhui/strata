@@ -94,6 +94,192 @@ class AnalysisFixture(unittest.TestCase):
         return sid
 
 
+class CollapseChainsTest(unittest.TestCase):
+    """一次增减只该占一行。
+
+    快照差是按目录逐层算的,所以 360Safe 长了 48 MB,它的每一层祖先都跟着
+    长 48 MB。原来直接按字节排序取前五,真实数据上出现过 Program Files (x86)、
+    ...\\360、...\\360\\360Safe 三行同一件事 —— 界面只显示四行,一件事吃掉三格。
+    """
+
+    def test_keeps_the_deepest_of_a_pass_through_chain(self) -> None:
+        """整条链只有一个来源时,报最深的那个 —— 它才指出是谁干的。"""
+        items = [
+            timeline.Contributor("Program Files", 48_000_000),
+            timeline.Contributor("Program Files\\360", 48_000_000),
+            timeline.Contributor("Program Files\\360\\360Safe", 48_000_000),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Program Files\\360\\360Safe"])
+
+    def test_keeps_the_parent_when_growth_is_spread(self) -> None:
+        """长的东西分散在很多子目录里时,父目录才是那件事。"""
+        items = [
+            timeline.Contributor("Users", 200_000_000),
+            timeline.Contributor("Users\\a", 1_000_000),
+            timeline.Contributor("Users\\b", 1_000_000),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Users"])
+
+    def test_drills_into_a_dominant_child(self) -> None:
+        """子目录占了绝大部分时报子目录,报父目录等于让人自己再找一遍。
+
+        真实数据:Program Files 减了 137.8 MB,其中 133.8 MB 是 OneDrive。
+        """
+        items = [
+            timeline.Contributor("Program Files", 137_800_000),
+            timeline.Contributor("Program Files\\Microsoft OneDrive", 133_800_000),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Program Files\\Microsoft OneDrive"])
+        self.assertEqual(out[0].bytes, 133_800_000)
+
+    def test_does_not_drill_when_the_child_is_not_dominant(self) -> None:
+        """最大的子目录只占一半 —— 说明是好几处一起在长,该报父目录。"""
+        items = [
+            timeline.Contributor("Users", 100_000_000),
+            timeline.Contributor("Users\\a", 50_000_000),
+            timeline.Contributor("Users\\b", 45_000_000),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Users"])
+
+    def test_drills_through_several_levels(self) -> None:
+        """一路都不分岔就一路钻到底。"""
+        items = [
+            timeline.Contributor("A", 1000),
+            timeline.Contributor("A\\b", 1000),
+            timeline.Contributor("A\\b\\c", 990),
+            timeline.Contributor("A\\b\\c\\d", 950),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["A\\b\\c\\d"])
+
+    def test_drill_stops_at_the_fork(self) -> None:
+        """钻到分岔就停,不能跳过分岔继续往下。"""
+        items = [
+            timeline.Contributor("A", 1000),
+            timeline.Contributor("A\\b", 1000),
+            timeline.Contributor("A\\b\\x", 500),
+            timeline.Contributor("A\\b\\y", 500),
+            timeline.Contributor("A\\b\\x\\deep", 500),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["A\\b"])
+
+    def test_ratio_boundary_is_inclusive(self) -> None:
+        """恰好等于阈值算占大头 —— 边界要定死,不然改比例会悄悄换结论。"""
+        items = [
+            timeline.Contributor("A", 1000),
+            timeline.Contributor("A\\b", 900),
+        ]
+        self.assertEqual(
+            [c.path for c in timeline._collapse_chains(items, ratio=0.9)], ["A\\b"]
+        )
+        items[1] = timeline.Contributor("A\\b", 899)
+        self.assertEqual(
+            [c.path for c in timeline._collapse_chains(items, ratio=0.9)], ["A"]
+        )
+
+    def test_unrelated_paths_all_survive(self) -> None:
+        """互不为祖先的目录一个都不能少 —— 这才是需要那几格的地方。"""
+        items = [
+            timeline.Contributor("Users\\a", 30),
+            timeline.Contributor("Windows\\b", 20),
+            timeline.Contributor("Program Files\\c", 10),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual(len(out), 3)
+
+    def test_shared_prefix_is_not_a_chain(self) -> None:
+        """Temp 和 Temp2 是兄弟,不是父子。只在分隔符处切才不会认错。"""
+        items = [
+            timeline.Contributor("Windows\\Temp", 50),
+            timeline.Contributor("Windows\\Temp2", 40),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Windows\\Temp", "Windows\\Temp2"])
+
+    def test_output_stays_sorted_by_bytes(self) -> None:
+        """折叠之后顺序还得是从大到小,界面直接切前几行。"""
+        items = [
+            timeline.Contributor("b", 10),
+            timeline.Contributor("a", 30),
+            timeline.Contributor("c", 20),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.bytes for c in out], [30, 20, 10])
+
+    def test_resorts_after_drilling_shrinks_a_value(self) -> None:
+        """钻下去会让字节变小,可能就排到别人后面了 —— 必须重排。
+
+        A 选中时 1000,钻到 A\\b 之后只剩 910,比 B 的 950 小。不重排的话
+        界面切前一行会切到 910 那个,而 950 才是最大的那件事。
+        """
+        items = [
+            timeline.Contributor("A", 1000),
+            timeline.Contributor("A\\b", 910),
+            timeline.Contributor("B", 950),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([(c.path, c.bytes) for c in out], [("B", 950), ("A\\b", 910)])
+
+    def test_drills_into_the_biggest_child_not_the_smallest(self) -> None:
+        """分岔不明显时也要认准占大头的那个。
+
+        A\\big 占了 A 的 95%,A\\small 只占 4%。往小的那边看会得出「没有哪个
+        子目录占大头」的结论,于是停在 A —— 把能指名的结论丢了。
+        """
+        items = [
+            timeline.Contributor("A", 1000),
+            timeline.Contributor("A\\big", 950),
+            timeline.Contributor("A\\small", 40),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["A\\big"])
+
+    def test_deeper_wins_when_a_middle_level_is_missing(self) -> None:
+        """链上缺了一层时,靠的是「同字节先取深的」那条平局规则。
+
+        比较用的目录集合是裁过的(深度上限、小目录合并),中间某层可能不在里面。
+        这时候从浅的那头钻不下去 —— children 里 A 的孩子是 A\\b,不是 A\\b\\c ——
+        所以必须一开始就选中最深的那个。
+        """
+        items = [
+            timeline.Contributor("A", 500),
+            timeline.Contributor("A\\b\\c", 500),      # A\b 这一层不在集合里
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["A\\b\\c"])
+
+    def test_shared_prefix_not_suppressed_in_either_order(self) -> None:
+        """Temp2 先被收录时,Temp 也不能被当成它的祖先误杀。
+
+        判断祖先必须要求紧跟分隔符。少了那一步,"Windows\\Temp2" 会以
+        "Windows\\Temp" 开头,于是后来的 Temp 被当成「已经报过了」丢掉。
+        """
+        items = [
+            timeline.Contributor("Windows\\Temp2", 50),   # 先被选中
+            timeline.Contributor("Windows\\Temp", 40),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["Windows\\Temp2", "Windows\\Temp"])
+
+    def test_two_separate_chains_each_report_once(self) -> None:
+        items = [
+            timeline.Contributor("A", 100),
+            timeline.Contributor("A\\x", 100),
+            timeline.Contributor("B", 50),
+            timeline.Contributor("B\\y", 50),
+        ]
+        out = timeline._collapse_chains(items)
+        self.assertEqual([c.path for c in out], ["A\\x", "B\\y"])
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(timeline._collapse_chains([]), [])
+
+
 class FillGapsTest(unittest.TestCase):
     def test_fills_missing_days(self) -> None:
         days = [
@@ -257,6 +443,30 @@ class MeasuredLayerTest(AnalysisFixture):
         paths = {c.path for c in change.contributors}
         self.assertIn("Users\\me\\Downloads", paths)
 
+    def test_a_chain_takes_one_slot_in_the_real_aggregation(self) -> None:
+        """整条祖先链只占归因列表的一格 —— 折叠要接在真正跑的那条路上。
+
+        单测 _collapse_chains 证明不了这件事:上面那个测试里三层各涨 600,
+        不折叠也一样通过(它只查 Downloads 在不在里面)。这里查的是「几行」,
+        没接上折叠的话会是 3 行同一件事,把界面前几格挤满。
+        """
+        self.add_snapshot(
+            taken_at=ts_at(-2),
+            scanned=1000,
+            dirs={"Users": 1000, "Users\\me": 800, "Users\\me\\Downloads": 500,
+                  "Games": 0},
+        )
+        self.add_snapshot(
+            taken_at=ts_at(-1),
+            scanned=1700,
+            dirs={"Users": 1600, "Users\\me": 1400, "Users\\me\\Downloads": 1100,
+                  "Games": 100},
+        )
+        days, _ = timeline._measured_days(self.conn, "C:", top_n=5)
+
+        got = [(c.path, c.bytes) for c in days[day_str(-1)].contributors]
+        self.assertEqual(got, [("Users\\me\\Downloads", 600), ("Games", 100)])
+
     def test_two_snapshots_same_day_merge(self) -> None:
         """一天多个快照时,净增减累加,归因也要合并而不是被覆盖。"""
         self.add_snapshot(taken_at=ts_at(-1, hour=9), scanned=1000, dirs={"A": 1000})
@@ -321,8 +531,10 @@ class BuildTimelineTest(AnalysisFixture):
         self.assertEqual(by_day[day_str(-4)].added, 900)
         self.assertEqual(by_day[day_str(-2)].basis, "measured")
         self.assertEqual(by_day[day_str(-2)].net, 400)
-        # 100 + 900 + 400 == 最新快照的 scanned_bytes
-        self.assertEqual(timeline.timeline_summary(changes)["net"], 1400)
+        # 100 + 900 + 400 == 最新快照的 scanned_bytes。这里把两种口径的量加在
+        # 一起,只是为了验「没有哪天被数两遍」;界面上它们是分开报的。
+        s = timeline.timeline_summary(changes)
+        self.assertEqual(s["retro_bytes"] + s["measured_net"], 1400)
 
     def test_two_snapshots_in_one_day_stay_retro(self) -> None:
         """同一天扫两次跨不过任何一天,那天仍归回溯。
@@ -421,8 +633,10 @@ class BuildTimelineTest(AnalysisFixture):
         self.assertEqual(by_day[day_str(-9)].added, 700)
         self.assertEqual(by_day[day_str(-1)].basis, "measured")
         self.assertEqual(by_day[day_str(-1)].net, 500)
-        # 中间那两天不再重复计上:总量是 700+500,不是 700+500+200+300
-        self.assertEqual(timeline.timeline_summary(changes)["net"], 1200)
+        # 中间那两天不再重复计上:总量是 700+500,不是 700+500+200+300。
+        # 同上,两种口径相加只用来验没重复,不是界面上的数。
+        s = timeline.timeline_summary(changes)
+        self.assertEqual(s["retro_bytes"] + s["measured_net"], 1200)
 
     def test_future_dated_buckets_do_not_stretch_the_axis(self) -> None:
         """真机上撞出来的:C 盘里有个文件创建时间写着 2030 年。
@@ -494,13 +708,40 @@ class TimelineSummaryTest(unittest.TestCase):
         s = timeline.timeline_summary(changes)
 
         self.assertEqual(s["days"], 4)
-        self.assertEqual(s["total_added"], 1310)
-        self.assertEqual(s["total_removed"], 550)
-        self.assertEqual(s["net"], 760)
         self.assertEqual(s["measured_days"], 2)
         self.assertEqual(s["retro_days"], 2)
         self.assertEqual(s["busiest_day"], "2026-04-02")
         self.assertEqual(s["first_measured_day"], "2026-04-03")
+        # 实测的三个数只统计实测那两天
+        self.assertEqual(s["measured_added"], 310)
+        self.assertEqual(s["measured_removed"], 550)
+        self.assertEqual(s["measured_net"], -240)
+        # 回溯的量单独放,不参与任何净值
+        self.assertEqual(s["retro_bytes"], 1000)
+
+    def test_does_not_report_a_combined_net(self) -> None:
+        """两层不能加在一起报成一个净变化。
+
+        回溯值是「现在盘上、创建于那天的字节数」,和实测的净增减不是同一种量:
+        真实数据上 2026-08-28 回溯说 +8.35 GB,实测说 -0.74 GB,差 9 GB。
+        加起来的那个数没有任何含义,而它以前就是界面顶部的大字。
+        """
+        changes = [
+            timeline.DayChange(day="2026-04-01", added=100, net=100, basis="retro"),
+            timeline.DayChange(day="2026-04-02", added=10, removed=500, net=-490,
+                               basis="measured"),
+        ]
+        s = timeline.timeline_summary(changes)
+        for gone in ("net", "total_added", "total_removed"):
+            self.assertNotIn(gone, s, f"{gone} 混了两种口径,不该再出现")
+
+    def test_retro_bytes_ignores_measured_days(self) -> None:
+        changes = [
+            timeline.DayChange(day="2026-04-01", added=700, net=700, basis="retro"),
+            timeline.DayChange(day="2026-04-02", added=9999, net=9999,
+                               basis="measured"),
+        ]
+        self.assertEqual(timeline.timeline_summary(changes)["retro_bytes"], 700)
 
     def test_empty(self) -> None:
         s = timeline.timeline_summary([])

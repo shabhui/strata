@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -234,6 +235,55 @@ class CollectEntriesFallbackTest(unittest.TestCase):
         self.assertGreater(len(entries), 0)
         self.assertEqual(reason, "调用方指定跳过 MFT")
         self.assertTrue(any("硬链接" in w for w in warnings))
+
+
+class FallbackReasonPersistedTest(unittest.TestCase):
+    """退化原因要跟着快照留在库里,不能只在扫描那一刻显示。
+
+    退回目录遍历意味着这次的数字口径变了(硬链接重复计数、算的是逻辑大小),
+    这个前提在快照活着的整段时间里都成立。原来它只出现在扫描返回值里,
+    刷一下页面就没了 —— 之后看这份数据的人不知道数字是怎么来的。
+    """
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        make_tree(self.root)
+
+    def _note(self):
+        """取最后一条快照的 note。
+
+        走的是 scan_drive 而不是 scan_directory —— 只有前者会调 collect_entries,
+        也就只有前者有退化原因可落。scan_drive 没有 label 参数,drive 列存的就是
+        传进去的那个路径,所以按临时目录查。
+        """
+        return self.conn.execute(
+            "SELECT note FROM snapshots WHERE drive = ? ORDER BY id DESC LIMIT 1",
+            (str(self.root),),
+        ).fetchone()["note"]
+
+    def test_reason_lands_in_snapshot_note(self):
+        snapshot.scan_drive(self.conn, str(self.root), prefer_mft=False)
+        note = self._note()
+        self.assertIn("跳过 MFT", note)
+
+    def test_reason_comes_before_the_warnings(self):
+        """原因排在最前面。后面那串是它的后果,先说因。"""
+        snapshot.scan_drive(self.conn, str(self.root), prefer_mft=False)
+        note = self._note()
+        self.assertLess(note.index("跳过 MFT"), note.index("硬链接"))
+
+    def test_no_reason_leaves_note_alone(self):
+        """MFT 走通的时候不该凭空多出一段话。"""
+        entries, _m, _w, _r = snapshot.collect_entries(str(self.root), prefer_mft=False)
+        with mock.patch.object(
+            snapshot, "collect_entries", return_value=(entries, "mft", [], None)
+        ):
+            snapshot.scan_drive(self.conn, str(self.root))
+        self.assertIsNone(self._note())
 
 
 if __name__ == "__main__":

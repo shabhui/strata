@@ -195,6 +195,20 @@ function renderBaseline() {
   asOf.appendChild(tag('span', { class: 'dim' }, snap ? 'as of ' : ''));
   asOf.appendChild(tag('b', null, snap ? fmtTime(snap.taken_at) : '尚无快照'));
   box.appendChild(asOf);
+
+  // 快照自带的口径说明。退回目录遍历时,上面那几个数字的含义变了(硬链接重复
+  // 计数、算的是逻辑大小),这条得跟着数字一直在,而不是只在扫描那一刻闪一下。
+  // 不做成可关闭的横幅:它描述的是当前这份数据本身,不是一次事件。
+  const noteBox = el('baselineNote');
+  if (noteBox) {
+    clear(noteBox);
+    if (snap && snap.note) {
+      noteBox.appendChild(tag('span', null, snap.note));
+      noteBox.hidden = false;
+    } else {
+      noteBox.hidden = true;
+    }
+  }
 }
 
 // ---- 年龄图例 ----
@@ -717,8 +731,9 @@ function renderTimeline() {
   /* 斜纹图案,两种 basis 各一份,颜色不同。
    *
    * 回溯层用斜纹、实测层用实心,这个区别不能只写在下面的说明文字里 ——
-   * 回溯值是「现存文件的创建日期」,看不到已删除的文件,是净增的下界;
-   * 实测值是两次快照相减,包含删除。混在一起画会让人把推断当成测量。 */
+   * 回溯值是「那天写的、现在还在盘上」的量,删掉的东西它一概看不见,所以
+   * 净减的日子它也只会画成正的;实测值是两次快照相减,含删除,是真的变化。
+   * 混在一起画会让人把推断当成测量。 */
   const defs = svg('defs');
   for (const [id, color] of [['hatchGrow', 'var(--grow)'], ['hatchShrink', 'var(--shrink)']]) {
     const pat = svg('pattern', {
@@ -1025,15 +1040,23 @@ function showDayTip(d, ev) {
     retro ? '回溯' : '实测'));
   tip.appendChild(head);
 
+  // 回溯日只有一个量:那天写入、现在还在盘上多少。它的 added 和 net 是同一个
+  // 数(后端两处都填了它),印成「新增 60 MB 净 +60 MB」既重复又在暗示这是
+  // 当天的净变化 —— 而回溯恰恰答不了那个问题。
   const m = tag('div', { class: 'm' });
-  m.appendChild(document.createTextNode('新增 '));
-  m.appendChild(tag('b', null, fmtBytes(d.added || 0)));
-  if (d.removed) {
-    m.appendChild(document.createTextNode('  减少 '));
-    m.appendChild(tag('b', null, fmtBytes(d.removed)));
+  if (retro) {
+    m.appendChild(document.createTextNode('写入还在盘上 '));
+    m.appendChild(tag('b', null, fmtBytes(d.added || 0)));
+  } else {
+    m.appendChild(document.createTextNode('新增 '));
+    m.appendChild(tag('b', null, fmtBytes(d.added || 0)));
+    if (d.removed) {
+      m.appendChild(document.createTextNode('  减少 '));
+      m.appendChild(tag('b', null, fmtBytes(d.removed)));
+    }
+    m.appendChild(document.createTextNode('  净 '));
+    m.appendChild(tag('b', null, fmtSigned(d.net || 0)));
   }
-  m.appendChild(document.createTextNode('  净 '));
-  m.appendChild(tag('b', null, fmtSigned(d.net || 0)));
   tip.appendChild(m);
 
   if (d.files_added) {
@@ -1050,13 +1073,24 @@ function showDayTip(d, ev) {
     tip.appendChild(u);
   }
 
-  for (const [label, list] of [['增长来自', d.contributors], ['减少来自', d.shrinkers]]) {
+  // 说「长得最多」而不是「增长来自」:上面那两个数是按顶层目录拆的净值,
+  // 这个列表是各深度上单个目录的涨跌榜,两者不是同一个口径。真实数据里
+  // Users 整体缩了 647 MB,里面的 .codex 却长了 87 MB —— 于是列表第一行会
+  // 比「新增」还大。写成「来自」等于说这是那个数的分解,那是不成立的。
+  //
+  // sign:shrinkers 后端存的是减少量的绝对值(排名和折叠都按大小来,存负数
+  // 要到处写 abs)。显示时必须自己带上负号,否则 fmtSigned 会给它加个加号,
+  // 把「缩了 753 MB」印成「+753 MB」。
+  for (const [label, list, sign] of [
+    ['长得最多', d.contributors, 1],
+    ['缩得最多', d.shrinkers, -1],
+  ]) {
     const top = (list || []).slice(0, 4);
     if (!top.length) continue;
     tip.appendChild(tag('div', { class: 'm sub' }, label));
     for (const c of top) {
       const row = tag('div', { class: 'm' });
-      row.appendChild(tag('b', null, fmtSigned(c.bytes)));
+      row.appendChild(tag('b', null, fmtSigned(sign * c.bytes)));
       row.appendChild(document.createTextNode('  ' + c.path));
       tip.appendChild(row);
     }
@@ -1064,7 +1098,7 @@ function showDayTip(d, ev) {
 
   if (retro) {
     tip.appendChild(tag('div', { class: 'm hint' },
-      '按现存文件的创建日期推算,当天建了又删的文件看不到,所以这是净增的下界'));
+      '这是那天写入、现在还留在盘上的量。当天建了又删的看不到,那天删掉的旧文件也看不到 —— 不等于那天的净变化'));
   }
   showTip(tip, ev);
 }
@@ -1075,11 +1109,23 @@ function renderTimelineSummary() {
   if (box) {
     clear(box);
     if (sum) {
-      const net = tag('b', { class: sum.net >= 0 ? 'grow' : 'shrink' }, fmtSigned(sum.net));
-      box.appendChild(tag('span', { class: 'dim' }, `${sum.days} 天净变化 `));
-      box.appendChild(net);
-      box.appendChild(tag('span', { class: 'dim' },
-        `  新增 ${fmtBytes(sum.total_added)} · 减少 ${fmtBytes(sum.total_removed)}`));
+      // 两层分开报。以前这里是「N 天净变化 +93 GB」,那个数把回溯量和实测差
+      // 加在了一起 —— 量纲不同,加出来的东西没有含义,而且系统性偏大:本机
+      // 报 +93 GB,推出 91 天前只用了 85.6 GB,可盘上「91 天以上」的文件现在
+      // 还有 81.3 GB,而那只是活下来的部分。
+      if (sum.retro_days) {
+        box.appendChild(tag('span', { class: 'dim' }, `近 ${sum.days} 天写入还在盘上 `));
+        box.appendChild(tag('b', null, fmtBytes(sum.retro_bytes)));
+      }
+      if (sum.measured_days) {
+        const net = tag('b', { class: sum.measured_net >= 0 ? 'grow' : 'shrink' },
+          fmtSigned(sum.measured_net));
+        box.appendChild(tag('span', { class: 'dim' },
+          `${sum.retro_days ? '  ·  ' : ''}实测 ${sum.measured_days} 天净变化 `));
+        box.appendChild(net);
+        box.appendChild(tag('span', { class: 'dim' },
+          `  增 ${fmtBytes(sum.measured_added)} · 减 ${fmtBytes(sum.measured_removed)}`));
+      }
     }
   }
 

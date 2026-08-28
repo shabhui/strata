@@ -23,6 +23,7 @@
   <div class="baseline" id="baseline">
     <span class="dim">读取中……</span>
   </div>
+  <div class="baseline-note" id="baselineNote" hidden></div>
 </header>
 
 <main class="wrap">
@@ -72,7 +73,7 @@
       <div class="tip" id="tlTip" role="tooltip"></div>
     </div>
     <p class="basis-note">
-      <span><i class="basis-swatch hatched"></i>回溯值:按现存文件的创建日推算,看不到已经删掉的东西,是净增的下界。</span>
+      <span><i class="basis-swatch hatched"></i>回溯值:那天写入、现在还留在盘上的量。删掉的东西它看不见,所以只增不减,不等于那天的净变化。</span>
       <span><i class="basis-swatch solid"></i>实测值:两次扫描的差,含删除,是真实净增减。</span>
     </p>
   </section>

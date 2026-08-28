@@ -172,7 +172,58 @@ class Handler(BaseHTTPRequestHandler):
         不选"先读干净再拒":体积超限的那条路径要读的正是我们刚判定读不起的东西。
         """
         self.close_connection = True
+        self._skipped_body = True     # finish() 得知道这条连接欠着一次收尾
         self._error(status, message)
+
+    # 这条连接拒过一个没读的请求体。默认 False,正常连接不进 finish 里那段。
+    #
+    # 这个标记是范围闸门,不是正确性闸门:去掉它、每条连接都收尾,行为几乎一样,
+    # 因为正常连接的 finish() 只在连接结束时才跑(那时响应早发完了),而客户端一关
+    # recv 立刻返回空、当场跳出。变异测试确认这一改动测不出差别,没为它编测试 ——
+    # 留着它是因为收尾只对"欠着一个没读的请求体"这件事有意义,别让它变成所有
+    # 连接都要走的一段。
+    _skipped_body = False
+
+    # 收尾最多花这么久,超了直接关(退回加这段之前的行为,不会更糟)。
+    # 只封时间不封字节:读到的每一块都当场扔掉,内存始终是一块的大小,唯一
+    # 花掉的资源就是这半秒。封字节反而有害 —— 4 MB 的请求体会在读满上限时
+    # 停下,剩下的没读走,close 照样 RST,等于白读一遍(实测 14/20 拿不到)。
+    LINGER_SECONDS = 0.5
+
+    def finish(self) -> None:
+        """关连接之前,把已经发来的请求体读掉扔了。
+
+        Windows 上 closesocket() 如果接收缓冲里还有没读走的数据,发的是 RST 而
+        不是 FIN;RST 会让对端把**已经收到但还没读**的字节一起丢掉 —— 也就是我们
+        刚发出去的那个 413/400/403。socketserver 在 close 之前是有 shutdown(SHUT_WR)
+        的,FIN 确实发了,但紧接着的 close 照样补一个 RST,照样把响应打掉。
+
+        实测(tools/probe_rst.py,声明超限长度、真发 N 字节、看客户端拿不拿到 413):
+            body 0 B / 1 KB      20 次全中
+            body 64 KB           1/20 拿不到,ConnectionAbortedError
+            body 256 KB          6/20 拿不到
+            body 1 MB            4/20 拿不到
+        随机跑整个测试集偶发的 ConnectionAbortedError 就是这个,概率约 1/12。
+
+        这不跟 _reject_unread 里"不先读干净再拒"矛盾:那说的是**判定之前**不能
+        把请求体收进内存 —— 要读的正是判定读不起的东西。这里判定早就做完、响应
+        也发出去了,只是走之前把在路上的字节倒掉,读到就扔,还带着时间封顶。
+        """
+        super().finish()              # 先把响应刷出去,再考虑收尾
+        if not self._skipped_body:
+            return
+        try:
+            deadline = time.monotonic() + self.LINGER_SECONDS
+            while True:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
+                self.connection.settimeout(remain)
+                if not self.connection.recv(65536):
+                    break             # 对端也关了,缓冲干净,可以放心 close
+        except OSError:
+            # 超时、对端已经 RST、socket 已经废了 —— 都没什么可做的,继续关
+            pass
 
     # ---- 路由 ----
     def do_GET(self) -> None:        # noqa: N802
