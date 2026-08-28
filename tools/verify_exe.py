@@ -17,6 +17,7 @@ manifest 本身另外验(读发布 exe 里嵌的资源,见下面 check_manifest)
 from __future__ import annotations
 
 import json
+import locale
 import os
 import shutil
 import subprocess
@@ -95,17 +96,46 @@ def build_test_exe(workdir: Path) -> Path | None:
     return exe
 
 
-def run(exe: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
-    """跑子命令。强制子进程用 UTF-8 输出。
+def decode_output(raw: bytes) -> str:
+    """按子进程真正用的编码解,而不是按我们希望的那个。
 
-    不设 PYTHONIOENCODING 的话,Windows 上写到管道用的是本地代码页(中文机器
-    上是 GBK),我们按 UTF-8 解就会把中文解成乱码,然后判据全部落空 ——
-    看起来像 exe 坏了,其实是这边解错了。
+    冻结后的 exe 不认 PYTHONIOENCODING —— 实测在中文 Windows 上它往管道写的是
+    GBK(本地代码页)。按 UTF-8 硬解,整段中文全变成问号,于是下面每一条中文
+    判据都永远不成立。这不只是日志难看:
+
+      if "警告:界面目录不存在" in out:  ← 永远不成立
+          BAD
+      else:
+          OK "界面目录找得到(web/ 打进去了)"  ← 于是永远走这里
+
+    web/ 真没打进去也照样报通过。检查哑掉的方式是"通过",比没有检查更糟。
+    数据库那条当初写成 endswith("strata.db") 才躲过一劫 —— 判据是 ASCII 的。
+
+    先试 UTF-8:哪天 PyInstaller 认了这个变量,或者换到英文机器上,拿到的就是
+    UTF-8,该按 UTF-8 解。GBK 编的中文散文几乎不可能同时是合法 UTF-8,所以
+    这个顺序不会误判。
+    """
+    for codec in ("utf-8", locale.getpreferredencoding(False), "cp936"):
+        try:
+            return raw.decode(codec)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def run(exe: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """跑子命令,拿字节回来自己解。
+
+    还是照旧设 PYTHONIOENCODING:它对源码模式有效,冻结后无效(见
+    decode_output),两种情况下 decode_output 都能解对。
     """
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    return subprocess.run(
-        [str(exe), *args], capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=timeout, env=env,
+    done = subprocess.run(
+        [str(exe), *args], capture_output=True, timeout=timeout, env=env,
+    )
+    return subprocess.CompletedProcess(
+        done.args, done.returncode,
+        decode_output(done.stdout or b""), decode_output(done.stderr or b""),
     )
 
 
@@ -125,12 +155,24 @@ def check_doctor(exe: Path) -> bool:
     out = proc.stdout
     ok = True
 
-    # 界面目录必须落在解包出来的临时目录里,而且确实存在
+    # 界面目录:两头都要查。
+    # 只查"有没有喊警告"不够 —— 那是个反向判据,措辞一改它就哑,而哑掉的方式
+    # 是通过。正向再要一条:doctor 打出来的那个路径必须落在 _MEIPASS 里。
+    # 落在源码树上说明 config.bundle_dir() 在冻结环境里没认出自己被打包了,
+    # 那么发到别人机器上就是 404 —— 在我们这台开发机上却看不出任何问题。
+    web_lines = [ln.strip() for ln in out.splitlines()
+                 if ln.strip().lower().endswith("web")]
     if "警告:界面目录不存在" in out:
         log("  BAD web/ 没打进去 —— serve 会全 404")
         ok = False
+    elif not web_lines:
+        log("  BAD doctor 输出里找不到界面目录那一行(格式变了?)")
+        ok = False
+    elif "_MEI" not in web_lines[0]:
+        log(f"  BAD 界面目录没落在解包目录里:{web_lines[0]}")
+        ok = False
     else:
-        log("  OK  界面目录找得到(web/ 打进去了)")
+        log(f"  OK  界面目录在解包目录里({web_lines[0].split(':', 1)[-1]})")
 
     # 数据库不能跟着跑到 _MEIPASS —— 那是临时目录,进程一退就没了,
     # 用户的历史快照会每次都丢。
@@ -215,10 +257,11 @@ def check_serve(exe: Path) -> bool:
     """真起一次服务,把界面和各个接口拉下来看。"""
     log("\n[5/5] 冻结后的 serve(真起服务)")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # 二进制管道 + 自己解:进程提前退的时候要读它的输出,那正是最需要看清
+    # 中文的时刻(端口占用、库锁住之类都是中文提示)。
     proc = subprocess.Popen(
         [str(exe), "serve", "--port", str(PORT), "--no-browser"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
     )
     base = f"http://127.0.0.1:{PORT}"
     try:
@@ -227,7 +270,7 @@ def check_serve(exe: Path) -> bool:
         for _ in range(60):
             if proc.poll() is not None:
                 log(f"  进程提前退了(返回码 {proc.returncode})")
-                log((proc.stdout.read() if proc.stdout else "")[-1200:])
+                log(decode_output(proc.stdout.read() if proc.stdout else b"")[-1200:])
                 return False
             try:
                 with urllib.request.urlopen(base + "/", timeout=2) as r:
