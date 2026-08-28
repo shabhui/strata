@@ -43,6 +43,24 @@ class ScanResult:
         )
 
 
+def _reparse_warning(count: int) -> list[str]:
+    """联接点/符号链接的说明。两种扫描方法都要用,措辞得一样。
+
+    这一条不是"出错了",是"这个数字为什么长这样":联接点自己算 0 字节,里面的
+    东西算在目标路径上。不说的话,树图里 runtime-sandbox\\abdata 显示 0,资源
+    管理器点进去却是 23 GB —— 看的人只能得出"这工具算不准"。
+
+    跟进才是错的:D: 上那两个 23.35 GB 的联接点都指向已经数过的 Koikatu\\abdata,
+    跟进就是把同一批字节数三遍,盘还会看起来比实际大 47 GB。
+    """
+    if not count:
+        return []
+    return [
+        f"{count:,} 个联接点/符号链接没有跟进(显示为 0 字节,"
+        f"真实体积算在目标路径上;跟进会重复计数)"
+    ]
+
+
 def _mft_to_scan_entries(
     entries: list[mft.FileEntry],
 ) -> tuple[list[tree.ScanEntry], int, list[str]]:
@@ -96,6 +114,12 @@ def _mft_to_scan_entries(
         warnings.append(
             f"{pstats.orphaned:,} 个目录父链断裂,{pstats.cycles:,} 个成环"
         )
+    # MFT 这边不存在"跟不跟进"的选择 —— 记录是平的,每个文件只有一条父链,
+    # 联接点里的东西本来就只会落在目标路径下。但看的人面对的是同一个 0 字节
+    # 目录,所以话也得说一样。
+    warnings.extend(
+        _reparse_warning(sum(1 for e in entries if e.is_reparse))
+    )
     if orphaned_bytes:
         warnings.append(f"{orphaned_bytes / 2**30:.2f} GiB 无法归属到路径")
 
@@ -178,6 +202,7 @@ def collect_entries(
     )
     if wstats.errors:
         warnings.append(f"{wstats.errors:,} 个目录/文件读取被拒(已跳过)")
+    warnings.extend(_reparse_warning(wstats.skipped_reparse))
     warnings.append("用目录遍历代替 MFT:硬链接会重复计数,大小是逻辑大小而非占盘大小")
     return _walk_to_scan_entries(raw_walk), "scandir", warnings, reason
 

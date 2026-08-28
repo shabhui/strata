@@ -1,6 +1,7 @@
 """对真实临时目录测试 scandir 扫描器与快照编排,不需要提权。"""
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -10,6 +11,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from strata.ntfs import attributes as A  # noqa: E402
+from strata.ntfs import mft  # noqa: E402
 from strata.scan import snapshot, walker  # noqa: E402
 from strata.store import db  # noqa: E402
 
@@ -284,6 +287,154 @@ class FallbackReasonPersistedTest(unittest.TestCase):
         ):
             snapshot.scan_drive(self.conn, str(self.root))
         self.assertIsNone(self._note())
+
+
+def make_junction(link: Path, target: Path) -> bool:
+    """建一个目录联接点。建不出来就返回 False,让用它的测试跳过。
+
+    用 mklink /J 而不是 os.symlink:目录联接点普通用户就能建,符号链接要么提权
+    要么开开发者模式 —— 这个测试文件的前提是"不需要提权"。
+    """
+    try:
+        done = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return False
+    return done.returncode == 0 and os.path.isjunction(link)
+
+
+class ReparseReportedTest(unittest.TestCase):
+    """联接点被跳过这件事,得让看的人知道。
+
+    背景是 D: 上真实踩到的:CharaStudio 那棵树里两个 23.35 GB 的联接点都指向
+    已经数过的 Koikatu\\abdata。不跟进是对的(跟进要把同一批字节数三遍,盘会
+    看起来大出 47 GB),但树图里那个目录显示 0 字节,资源管理器点进去是 23 GB
+    —— 之前屏幕上没有任何一句话解释这个差,只能让人以为工具算不准。
+    """
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.sizes = make_tree(self.root)
+        if not make_junction(self.root / "shortcut", self.root / "sub"):
+            self.skipTest("这台机器建不了目录联接点")
+
+    def test_walker_does_not_follow_it(self):
+        """先确认前提:跳过了,而且计了数。不然下面测的都是空的。"""
+        _entries, stats = walker.walk_drive(str(self.root))
+        self.assertEqual(stats.skipped_reparse, 1)
+        self.assertEqual(stats.bytes_total, sum(self.sizes.values()))
+
+    def test_the_junction_itself_shows_zero(self):
+        """联接点自己算 0 —— 这正是屏幕上那个让人困惑的 0,得有话解释它。"""
+        entries, _stats = walker.walk_drive(str(self.root))
+        link = next(e for e in entries if e.name == "shortcut")
+        self.assertTrue(link.is_dir)
+        self.assertEqual(link.bytes, 0)
+
+    def test_it_lands_in_the_snapshot_note(self):
+        """落进 note,而不是只在扫描返回值里晃一下。
+
+        note 是常驻在基线数字下面那一行的,描述的是"这份数据是什么口径"。
+        联接点这件事在快照活着的整段时间里都成立,所以归它。
+        """
+        snapshot.scan_drive(self.conn, str(self.root), prefer_mft=False)
+        note = self.conn.execute(
+            "SELECT note FROM snapshots WHERE drive = ? ORDER BY id DESC LIMIT 1",
+            (str(self.root),),
+        ).fetchone()["note"]
+        self.assertIn("联接点", note)
+        self.assertIn("1 个", note)
+
+    def test_says_where_the_bytes_actually_went(self):
+        """光说"跳过了"没用 —— 得说清那 23 GB 算在哪了,不然还是像丢了。"""
+        _e, _m, warnings, _r = snapshot.collect_entries(
+            str(self.root), prefer_mft=False
+        )
+        line = next(w for w in warnings if "联接点" in w)
+        self.assertIn("0 字节", line)
+        self.assertIn("目标路径", line)
+
+    def test_counts_them_all(self):
+        """两个联接点要说 2 个。写死"有联接点"的话这里看不出来。"""
+        self.assertTrue(make_junction(self.root / "shortcut2", self.root / "sub"))
+        _e, _m, warnings, _r = snapshot.collect_entries(
+            str(self.root), prefer_mft=False
+        )
+        self.assertTrue(any("2 个联接点" in w for w in warnings))
+
+
+class MftReparseSameWordingTest(unittest.TestCase):
+    """MFT 那条路也要说同一句话。
+
+    这里没法造真联接点来跑 MFT —— 直读卷要提权。但两条路给出的说明必须一字不差:
+    看的人不知道自己走的是哪条,同一个 0 字节目录换个方法换套说法,只会更糊。
+    所以直接喂 FileEntry,查两边过的是同一个措辞函数。
+    """
+
+    ROOT = 5      # mft.ROOT_RECORD,父链的终点
+
+    def _entries(self, junctions: int):
+        """一个根目录 + 若干联接点目录 + 一个普通文件。"""
+        out = [
+            mft.FileEntry(record=self.ROOT, parent=self.ROOT, name=".", is_dir=True),
+            mft.FileEntry(
+                record=100, parent=self.ROOT, name="real.bin", is_dir=False, bytes=4096
+            ),
+        ]
+        for i in range(junctions):
+            out.append(
+                mft.FileEntry(
+                    record=200 + i,
+                    parent=self.ROOT,
+                    name=f"link{i}",
+                    is_dir=True,
+                    attributes=A.FILE_ATTR_DIRECTORY | A.FILE_ATTR_REPARSE_POINT,
+                )
+            )
+        return out
+
+    def test_wording_matches_the_scandir_path(self):
+        _out, _orphan, warnings = snapshot._mft_to_scan_entries(self._entries(2))
+        self.assertEqual(
+            [w for w in warnings if "联接点" in w],
+            snapshot._reparse_warning(2),
+        )
+
+    def test_counts_only_the_reparse_ones(self):
+        """普通文件和根目录不能被算进去。"""
+        _out, _orphan, warnings = snapshot._mft_to_scan_entries(self._entries(3))
+        self.assertTrue(any("3 个联接点" in w for w in warnings))
+
+    def test_silent_when_there_are_none(self):
+        _out, _orphan, warnings = snapshot._mft_to_scan_entries(self._entries(0))
+        self.assertFalse([w for w in warnings if "联接点" in w])
+
+
+class NoReparseNoLineTest(unittest.TestCase):
+    """没有联接点的时候不能凭空多出一句话。
+
+    note 那一行是给人看的,每多一句都在挤掉别的。没发生的事不该占位置。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        make_tree(self.root)
+
+    def test_clean_tree_has_no_reparse_line(self):
+        _e, _m, warnings, _r = snapshot.collect_entries(
+            str(self.root), prefer_mft=False
+        )
+        self.assertFalse([w for w in warnings if "联接点" in w])
 
 
 if __name__ == "__main__":

@@ -1351,9 +1351,10 @@ function setScanState(state) {
     if (r.duration_ms) bits.push((r.duration_ms / 1000).toFixed(1) + ' 秒');
     label.appendChild(tag('span', { class: 'dim' }, bits.join(' · ')));
     label.hidden = false;
-    if (r.fallback_reason) {
-      label.appendChild(tag('span', { class: 'bad' }, '  退回目录遍历:' + r.fallback_reason));
-    }
+    // 这里不再重复退化原因。它已经落进快照,常驻在基线数字下面那一行 —— 那是
+    // 它该待的地方(描述的是这份数据本身,不是刚才那一次扫描)。两处都印的话,
+    // 加上顶上的提权横幅,同一件事连着三段橙字,反而没人看了。
+    // 这一行只留「什么时候扫的、用什么扫的、花了多久」,方法名本身就够指出退化。
   } else {
     label.hidden = true;
   }
@@ -1478,6 +1479,11 @@ async function loadDrive(drive, opts) {
   renderBaseline();
 
   const jobs = [
+    // 基线数字必须跟着重取。S.drives 原来只在开机时填一次,之后再没动过 ——
+    // 于是扫完一个盘,上面那行还是「尚无快照」,扫到/文件/快照个数和口径说明
+    // 全都不出现,非得刷新页面才对。而下面的时间轴已经是新数据了,同一屏上
+    // 两半自相矛盾。换盘也一样:开着页面扫完 D: 再切过去,看到的是空的。
+    api('/api/status').then((r) => { S.status = r; S.drives = r.drives || []; }),
     api('/api/timeline', { drive, days: 90 }).then((r) => { S.timeline = r; }),
     api('/api/tree', { drive, path: S.path || null }).then((r) => { S.tree = r; }),
     api('/api/hotspots', { drive }).then((r) => { S.hotspots = r; }),
@@ -1489,6 +1495,9 @@ async function loadDrive(drive, opts) {
   const failed = results.filter((r) => r.status === 'rejected');
   if (failed.length) banner(failed[0].reason.message);
 
+  // 上面已经用旧数据画过一次(先出东西比等着好),status 回来之后再画准的那一版
+  renderDriveTabs();
+  renderBaseline();
   renderTimeline();
   renderLegend();
   renderCrumbs();
