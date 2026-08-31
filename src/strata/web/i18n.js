@@ -260,6 +260,15 @@ Object.assign(STRINGS, {
            `Hard links and on-disk size are counted differently, so treat the ` +
            `deltas as rough`,
   ],
+  'diff.caveat.rulesChanged': [
+    (v) => `这两个快照之间,${v.method} 的占盘算法修过一次:以前把 Compact OS ` +
+           `压缩过的系统文件按解压后的大小算了。所以这里的「减少」有一部分是` +
+           `口径修正,不是硬盘上真的少了东西`,
+    (v) => `Between these two snapshots the ${v.method} size accounting was ` +
+           `corrected: Compact OS compressed system files used to be counted at ` +
+           `their uncompressed size. Part of the drop shown here is that ` +
+           `correction, not data actually leaving the disk`,
+  ],
   'diff.caveat.noFilesEitherSide': [
     '两个快照都没有文件明细(已降级),只能对比目录',
     'Neither snapshot kept file-level detail (both coarsened), so only directories are compared',

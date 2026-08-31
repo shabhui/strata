@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from .. import config
+from ..store import db
 
 GREW = "grew"
 SHRANK = "shrank"
@@ -174,6 +175,18 @@ def diff_snapshots(
             "code": "mixedMethod",
             "vars": {"before": before["method"], "after": after["method"]},
         })
+    # 两边都是 mft、但跨了字节口径的分界:显示出来的增减里混着口径调整,
+    # 不是硬盘上的变化。分界的来历见 store/db.py 的 BYTE_RULES_KEY。
+    #
+    # 只对 mft 报:口径只在那条路上改过(WOF 压缩的真实占盘)。scandir 两边
+    # 都是 st_size,没变。不加这个条件的话所有跨越升级点的对比都会挂上这句,
+    # 包括根本不受影响的 —— 到处都出现的提示等于没有提示。
+    boundary = db.byte_rules_boundary(conn)
+    if (
+        before["method"] == after["method"] == "mft"
+        and before_id < boundary <= after_id
+    ):
+        caveats.append({"code": "rulesChanged", "vars": {"method": "mft"}})
 
     dir_deltas = _deltas(
         _dirs(conn, before_id, max_depth),

@@ -107,6 +107,7 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA cache_size = -{config.SQLITE_CACHE_KIB}")
     _ensure_schema(conn)
+    ensure_byte_rules_boundary(conn)   # 一次性,只在第一次见到这个库时定
     repair_timestamps(conn)      # 一次性,靠 meta 里的标记跳过。见函数说明。
     return conn
 
@@ -118,6 +119,64 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (SCHEMA_VERSION,),
     )
+
+
+# 字节口径分界:这个号及以后的快照按新口径算,之前的按老口径。
+#
+# 为什么需要它:WOF 那个修法让 mft 那条路对 C: 少报约 38.5 GiB(原来把
+# Compact OS 压过的文件按解压后的大小算了,见 ntfs/mft.py 的 WOF_STREAM)。
+# 修得对,但升级后第一次扫完,对比页会显示「减少 38 GB」——**硬盘上什么都
+# 没发生**。一个专门回答「空间去哪了」的工具把自己的口径调整说成用户删了
+# 38 GB,比不给数字更糟:用户会去找那 38 GB,或者以为清理生效了。
+#
+# 已有的 mixedMethod 提示挡不住:那条看的是 method 变了没(mft ↔ scandir),
+# 这里两边都是 mft,变的是同一条路的算法。
+#
+# 不加表列是因为库里没有迁移机制 —— schema.sql 全是 CREATE TABLE IF NOT
+# EXISTS、每次连库重跑一遍,加列对已存在的表不生效。为一个布尔量引进
+# ALTER TABLE 那套不值得,meta 表本来就是干这个的(TS_REPAIR_KEY 同理)。
+BYTE_RULES_KEY = "byte_rules_wof_v1"
+
+
+def ensure_byte_rules_boundary(conn: sqlite3.Connection) -> None:
+    """第一次见到这个库时,把分界定在「当前最大快照号 + 1」。
+
+    已经在库里的快照一律算老口径 —— 它们确实是老代码扫出来的。空库定成 1,
+    于是往后全是新口径,不会有跨口径的对比。
+
+    只在缺这个键时写。每次连库重算的话分界会一直追着最新快照跑,于是永远
+    凑不出跨口径的一对,那句提示永远不出现 —— 又是一条永远通过的检查。
+
+    「只写一次」有两道保险:开头这个提前返回,和 SQL 里的 ON CONFLICT DO
+    NOTHING。两道都能单独兜住(变异测过:各去掉一道,行为不变;两道都去掉,
+    test_boundary_does_not_move_on_later_connects 才红)。别把任何一道当死代码
+    删掉 —— 上面 _ensure_schema 用的是 DO UPDATE,照那个样子改这里正是会出错
+    的那种编辑。提前返回顺带省掉每次连库那次 MAX(id)。
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (BYTE_RULES_KEY,)
+    ).fetchone()
+    if row is not None:
+        return
+    largest = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM snapshots").fetchone()
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (BYTE_RULES_KEY, str(int(largest["m"]) + 1)),
+    )
+
+
+def byte_rules_boundary(conn: sqlite3.Connection) -> int:
+    """分界快照号。缺失或坏值时按 1 处理(等于「全是新口径」,不出提示)。"""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (BYTE_RULES_KEY,)
+    ).fetchone()
+    if row is None:
+        return 1
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 1
 
 
 # 洗过坏时间戳的标记。见 repair_timestamps()。
