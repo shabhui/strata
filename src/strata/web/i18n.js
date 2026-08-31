@@ -19,9 +19,27 @@ const EN = 1;
  * 有这么个函数是因为散着写三元表达式漏得太容易 —— 实际上就漏过:界面上出现过
  * 「1 days measured」。中文没有这回事,所以只有英文那半用得上它。
  *
- * 不规则复数(entry/entries)传第三个参数;规则的只传单数形式。 */
+ * 不规则复数(entry/entries)传第三个参数;规则的只传单数形式。
+ *
+ * 这里先 Number() 一下,因为调用方经常传的是**格式化过的字符串**:界面上
+ * 是 t('del.coverageEvents', { n: fmtCount(cov.events) }),送进来的是 '1' 而不是 1。
+ * 原来直接 n === 1 严格比,'1' 不等于 1,于是界面上印的是「, 1 entries」——
+ * 而测试给的是数字,看到的是「, 1 entry」,一路绿灯。这是这个项目最反对的那种
+ * 检查:输入形状跟线上不一样,所以它只会通过。
+ *
+ * 已经有 5 个 key 各自写了 plural(Number(v.n), ...) 绕过这件事(age.days、
+ * grid.fileCount 那几个),说明这个坑踩过了,只是没修在根上。挪到这儿来一次,
+ * 那几处的 Number() 就成了冗余但无害的写法。
+ *
+ * '1,234' 这种带千位分隔符的会 Number() 成 NaN,而 NaN !== 1,走复数 —— 正确。 */
 function plural(n, one, many) {
-  return n === 1 ? one : (many !== undefined ? many : one + 's');
+  return Number(n) === 1 ? one : (many !== undefined ? many : one + 's');
+}
+
+/* 千位分隔符。app.js 里有个 fmtCount 做同一件事,但这个文件必须能单独加载
+ * (tests/test_i18n.py 就是拿 node 单独跑它的),不能反过来依赖 app.js。 */
+function fmtInt(n) {
+  return Number(n || 0).toLocaleString(LOCALES[index()]);
 }
 
 // key: [中文, English]
@@ -119,6 +137,15 @@ Object.assign(STRINGS, {
   'tm.shareOfLevel': [(v) => `  占本层 ${v.share}`, (v) => `  ${v.share} of this level`],
   'tm.lastWrite': ['最近写入 ', 'last write '],
   'tm.clickEnter': ['点击进入', 'click to enter'],
+  // 树图上补的那一块:本层直属文件 + 扫描时被折叠的小目录。
+  // 不叫「其他」是因为那听起来像凑数;这两样都是真实占用,只是没有独立格子。
+  'tm.restOfLevel': ['本层文件', 'files at this level'],
+  'tm.restHint': ['直接放在本目录下的文件,不属于任何子目录',
+                  'files sitting directly in this folder, not in any subfolder'],
+  'tm.restWithFolded': [
+    (v) => `本目录下的文件,以及 ${v.n} 个太小而未单列的子目录`,
+    (v) => `files in this folder, plus ${v.n} ${plural(v.n, 'subfolder')} too small to list`,
+  ],
   'tm.crumbHint': ['点块进入子目录', 'click a block to go deeper'],
   'tm.thisLevel': ['本层 ', 'this level '],
 
@@ -144,6 +171,65 @@ Object.assign(STRINGS, {
     (v) => ` ${v.n} of them have no matching path in any snapshot, so the size ` +
            'cannot be worked out. Left blank rather than guessed.',
   ],
+  // 提了权但日志读不了。以前跟「真的没删过东西」走同一条路 —— 整段藏掉,
+  // 用户看到的跟「什么都没删过」一模一样,而真相是「我没看成」。
+  // NTFS 上 USN 日志是可以关的,不少机器默认就是关的,所以这条很常见。
+  // why 是后端存下来的具体原因,原样带出来:前端猜不出是哪种,猜错比不说更糟。
+  'del.unavailable': [
+    (v) => `读不了这个盘的变更日志,所以这一栏是空的 —— 不是因为没删过东西,`
+           + `而是没看成。原因:${v.why}`,
+    (v) => 'The change journal for this drive could not be read, so this panel is '
+           + 'empty. Not because nothing was deleted, but because it could not '
+           + `look. Reason: ${v.why}`,
+  ],
+  'del.unavailableUnknown': ['没有记下具体原因', 'no reason was recorded'],
+  'del.unavailableRow': ['读不了变更日志', 'Change journal unreadable'],
+  // 反查不出路径的行。日志记的是文件 ID,得靠扫描时的目录表换成路径 —— 整棵
+  // 目录树在扫描前就没了的话换不出来。实盘上 D: 盘 32031 条删除里只有 450 条
+  // 能换出路径。这种行只有名字,而名字会重(problems-report.html 出现 5 次),
+  // 看着像列表出了毛病,所以得说一句这是怎么回事。
+  'del.noPathRow': [
+    '只知道文件名,不知道它在哪 —— 它所在的目录在扫描之前就已经删掉了,'
+    + '反查不出路径。同名的行是不同的文件。',
+    'Only the name is known, not the location. The directory it lived in was '
+    + 'already gone before the scan, so the path cannot be recovered. Rows '
+    + 'sharing a name are different files.',
+  ],
+  'del.noPathNote': [
+    (v) => ` 另有 ${v.n} 条只查到文件名:它们所在的目录在扫描前就没了,`
+           + '反查不出路径,所以排在后面,也没法定位。',
+    (v) => ` Another ${v.n} ${plural(v.n, 'entry', 'entries')} have a name but no `
+           + 'path: the directories they lived in were gone before the scan. They '
+           + 'sort last and cannot be located.',
+  ],
+  // 一个文件在窗口里被删了好多次。USN 记的是操作不是文件,一次「建-写-关-删」
+  // 就是好几条记录,而反复重建的临时文件会攒出上百条。现在按路径合并成一行,
+  // 但次数本身有用 —— 它把「丢了个东西」和「这是个临时文件」区分开,所以标出来。
+  'del.times': [(v) => `×${v.n}`, (v) => `×${v.n}`],
+  'del.timesNote': [
+    (v) => `这个路径在窗口里出现 ${v.n} 次,合并成了一行。时间是最后一次。`,
+    (v) => `This path appears ${v.n} ${plural(v.n, 'time')} in the window, ` +
+           'collapsed into one row. The timestamp is the most recent one.',
+  ],
+  // 不提权时读不了 USN 日志,这一栏永远是空的。以前整段藏掉,于是这个功能
+  // 对非管理员用户等于不存在 —— 现在把话说出来。
+  'del.needAdmin': [
+    '读变更日志需要管理员权限。现在这一栏是空的,不是因为没有删除过东西,' +
+    '而是没权限去看。以管理员身份重新启动就能看到。',
+    'Reading the change journal needs administrator rights. This panel is empty ' +
+    'because it cannot look, not because nothing was deleted. Restart as ' +
+    'administrator to see it.',
+  ],
+  'del.needAdminRow': ['没有权限读取', 'No permission to read'],
+  // 只有一次快照时说这句。原来整段藏掉,第一次用的人不知道「再扫一次就有对比」。
+  'diff.needTwo': [
+    '要两次扫描才能对比。现在只有一次快照 —— 过一段时间再扫一次,' +
+    '这里就会显示这期间涨了什么、缩了什么。',
+    'Comparing needs two scans. There is only one snapshot so far. Scan again ' +
+    'later and this will show what grew and what shrank in between.',
+  ],
+  // 表格空态。不能写「没有目录变大」—— 那是比较过之后的结论,而这里根本没比。
+  'diff.notYet': ['还没有可比的两次扫描', 'No two scans to compare yet'],
 
   // ---- 两次扫描之间 ----
   'diff.title': ['最近两次扫描之间', 'Between the last two scans'],
@@ -361,6 +447,15 @@ Object.assign(STRINGS, {
   'scan.inProgress': ['正在扫描', 'Scanning'],
   'scan.phase': [(v) => `${v.drive} ${v.phase},大盘要几十秒`,
                  (v) => `${v.drive} ${v.phase} — a big drive takes a minute`],
+  /* 数到多少了。不显示百分比:总数要等扫完才知道,拿上一次快照的数去估,
+   * 会在盘上东西变多时卡在 99% —— 那比没有进度更让人以为卡死了。
+   * 一个见涨的绝对数说明的是同一件事(它还在动),而且不会说谎。 */
+  /* n 是原始数字,两种语言都自己格式化 —— 跟 tl.spanDays 一路。
+   * 不预先在 app.js 里格式化成字符串再传进来:英文这半要拿数字判单复数,
+   * 传字符串就得反过来解析,而 toLocaleString 在不同语言下会加不同的分隔符。 */
+  'scan.phaseCounted': [(v) => `${v.drive} ${v.phase},已数 ${fmtInt(v.n)} 项`,
+                        (v) => `${v.drive} ${v.phase} — ${fmtInt(v.n)} ` +
+                               `${plural(v.n, 'item', 'items')} so far`],
   'scan.failed': ['上次扫描失败:', 'Last scan failed: '],
   'scan.doneAt': ['扫完于 ', 'finished '],
   'scan.seconds': [' 秒', 's'],

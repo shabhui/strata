@@ -126,6 +126,14 @@ for (const lang of ['zh', 'en']) {
   out[lang] = many.seen;
   // 数量为 1 的那一遍:英文单复数只在 n===1 时才走另一支,给 2 永远测不到。
   out[lang + ':one'] = sweep(1).seen;
+  // 再来一遍 n='1' —— 字符串,而不是数字。
+  //
+  // 这是界面真实的传法:t('del.coverageEvents', { n: fmtCount(cov.events) }),
+  // fmtCount 出来的是字符串。上面两遍全给数字,于是 plural() 里的 n === 1
+  // 严格比在测试里成立、在界面上不成立,「, 1 entries」就这么漏到线上了。
+  //
+  // 测试的输入形状跟线上不一样,这个检查就只会通过。补上这一遍。
+  out[lang + ':oneStr'] = sweep('1').seen;
 }
 process.stdout.write(JSON.stringify(out));
 """
@@ -227,6 +235,46 @@ class StringTableTest(unittest.TestCase):
             if hit:
                 leaked.append(f"{key}: 「{hit.group(0)}」 应该是单数 —— {value}")
         self.assertEqual(leaked, [], "\n".join(leaked))
+
+    def test_english_singular_when_count_is_the_string_one(self) -> None:
+        """数量传成字符串 '1' 的时候也不能用复数 —— 界面就是这么传的。
+
+        上一个测试给的是数字 1,而界面给的是 fmtCount 的输出,也就是 '1':
+
+            t('del.coverageEvents', { n: fmtCount(cov.events) })
+
+        plural() 里原来是 n === 1 严格比,'1' !== 1,于是走复数分支。测试看到的是
+        「, 1 entry」,界面上印的是「, 1 entries」—— 实测确认过。检查的输入形状跟
+        线上不一样,它就只会通过。
+
+        i18n.js 里已经有 5 个 key 各自写了 plural(Number(v.n), ...) 绕过这件事,
+        说明这坑早踩过,只是没修在根上。现在 plural() 自己 Number() 一下,这个
+        测试盯着别再退回去。
+        """
+        bad_plural = re.compile(r"\b1 ([a-z]+[^s\W])s\b")
+        leaked = []
+        for key, value in self.strings["en:oneStr"].items():
+            if value.startswith("__THREW__"):
+                continue
+            hit = bad_plural.search(value)
+            if hit:
+                leaked.append(f"{key}: 「{hit.group(0)}」 应该是单数 —— {value}")
+        self.assertEqual(leaked, [], "\n".join(leaked))
+
+    def test_string_and_number_counts_agree(self) -> None:
+        """给 1 和给 '1' 得出一样的文案。
+
+        不然就是某处又在拿数字跟字符串严格比。这条比上面那条更宽:它不光管
+        单复数,任何「形状不同结果就不同」的写法都会被抓住。
+        """
+        differ = [
+            f"{lang} {key}:\n    数字 1 → {self.strings[lang + ':one'][key]}\n"
+            f"    字符串 '1' → {value}"
+            for lang in ("zh", "en")
+            for key, value in self.strings[lang + ":oneStr"].items()
+            if value != self.strings[lang + ":one"].get(key)
+        ]
+        self.assertEqual(differ, [], "\n".join(differ))
 
     def test_nothing_threw_at_one(self) -> None:
         """n=1 那一遍也要能求值,别只在 n=2 时不炸。"""
@@ -393,6 +441,49 @@ class BackendCodeCoverageTest(unittest.TestCase):
             if key.startswith("clean.rule.") and key.split(".")[2] not in codes
         )
         self.assertEqual(orphans, [], "文案没有对应的规则:" + "\n".join(orphans))
+
+    def test_every_key_app_js_asks_for_exists(self) -> None:
+        """app.js 里 t('键') 用到的键都得在 i18n.js 里。
+
+        这是上面两条的反面:那两条查后端的代号,这条查前端自己写的键。键拼错了
+        t() 会把键本身还回去 —— 界面上显示「tm.restOfLevel」这种东西,代码照跑,
+        测试照绿。加文案时只改了 app.js 忘了改 i18n.js,症状一样。
+
+        字面量后面必须紧跟 , 或 ) 才算一个完整的键。不加这个约束,
+        `t('age.' + this.key)` 会被当成一个叫 'age.' 的键,报一条假的 ——
+        这条检查第一版就是这么误报的。前缀式的调用由下一条管。
+        """
+        src = APP_JS.read_text(encoding="utf-8")
+        pat = re.compile(r"\bt\(\s*(['\"])([^'\"]*)\1\s*[,)]")
+        used = {m.group(2): src[:m.start()].count("\n") + 1
+                for m in pat.finditer(src)}
+        self.assertTrue(used, "没在 app.js 里找到任何 t('键'),正则该改了")
+        missing = sorted(f"app.js:{line} 用了不存在的键「{key}」"
+                         for key, line in used.items() if key not in self.keys)
+        self.assertEqual(missing, [], "\n".join(missing))
+
+    def test_prefix_built_keys_resolve(self) -> None:
+        """t('前缀' + 变量) 拼出来的键也得存在。
+
+        上一条按「后面紧跟 , 或 )」把这种调用排掉了,不然会误报。但排掉不等于
+        不用查:AGE_BANDS 的 key 改一个字,色带上那一格就显示「age.weekly」。
+
+        只认 AGE_BANDS 这一处 —— 目前 app.js 里就这一个前缀式调用,而它的取值
+        是同文件里的一个字面量数组,能静态读出来。以后多出别的前缀式调用,
+        下面那条断言会红,提醒把它也加进来。
+        """
+        src = APP_JS.read_text(encoding="utf-8")
+        prefixes = re.findall(r"\bt\(\s*(['\"])([^'\"]*)\1\s*\+", src)
+        self.assertEqual(
+            [p[1] for p in prefixes], ["age."],
+            "app.js 多了前缀式的 t() 调用,这条检查得跟着扩:" + str(prefixes))
+
+        block = re.search(r"const AGE_BANDS = \[([\s\S]*?)\]", src)
+        self.assertIsNotNone(block, "找不到 AGE_BANDS,正则该改了")
+        bands = re.findall(r"key:\s*'(\w+)'", block.group(1))
+        self.assertTrue(bands, "AGE_BANDS 里没读出 key")
+        missing = sorted(f"age.{b}" for b in bands if f"age.{b}" not in self.keys)
+        self.assertEqual(missing, [], "色带的键没文案:" + "\n".join(missing))
 
     def test_every_diff_caveat_has_text(self) -> None:
         """diff.py 里 {"code": "xxx"} 的每个代号都得有文案。

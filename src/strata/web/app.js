@@ -25,6 +25,7 @@ const S = {
   fade: new Map(),     // path -> 当前透明度,用于补间
   anim: null,
   scanPoll: null,
+  scanPollErrors: 0,   // 连续取状态失败的次数,见 SCAN_POLL_MAX_ERRORS
   /* 时间轴的可见窗口:[起, 止) 在 days 数组里的下标。null = 全部。
    * 缩放不是把画面放大 —— 那样只会把字一起拉糊。这里是少画几天、每天
    * 画宽一点,纵轴按窗口内的峰值重算。
@@ -337,7 +338,7 @@ let tmHover = null;
 function treeItems() {
   if (!S.tree) return [];
   const raw = (S.tree.children || []).filter((c) => c.bytes > 0);
-  return raw.map((c) => ({
+  const items = raw.map((c) => ({
     value: c.bytes,
     name: c.name,
     path: c.path,
@@ -350,6 +351,39 @@ function treeItems() {
     isDir: (c.dirs || 0) > 0 || (c.files || 0) > 0,
     band: ageBand(c.newest_ctime),
   }));
+
+  // 补一块「本层直属文件 + 被折叠的小目录」。
+  //
+  // 上面那些格子只是子目录,本层总量(node.bytes)还含两部分它们盖不住的:
+  // 直属在本目录下的文件(own_bytes),以及扫描时被裁掉的小目录(folded_bytes,
+  // 后端一直在给,前端从来没画)。不补这一块,树图铺满的面积就小于它自己写的
+  // 总数 —— 盘根最明显:pagefile.sys 和 hiberfil.sys 直挂根下,真机上是个
+  // 20 GB 的洞。
+  //
+  // 没有路径,所以不可点、不可进、右键也不给"在资源管理器中显示"。
+  const n = S.tree.node;
+  if (n) {
+    const rest = (n.own_bytes || 0) + (n.folded_bytes || 0);
+    if (rest > 0) {
+      items.push({
+        value: rest,
+        // 哨兵而不是 null:tmHover 初值就是 null,而画的时候按
+        // `tmHover === it.path` 判高亮 —— 用 null 的话这一块在鼠标还没进画布
+        // 时就自带白框。真实相对路径不可能含 \x00,不会撞。
+        path: '\x00rest',
+        name: t('tm.restOfLevel'),
+        bytes: rest,
+        files: null,
+        dirs: 0,
+        ctime: null,
+        isDir: false,
+        synthetic: true,
+        foldedChildren: n.folded_children || 0,
+        band: ageBand(null),
+      });
+    }
+  }
+  return items;
 }
 
 function treeTotal() {
@@ -483,6 +517,17 @@ function hitTest(px, py) {
   return null;
 }
 
+/* 这一格指向盘上的哪个东西。指不着就给 null。
+ *
+ * 「本层文件」那一块是 treeItems() 补出来的,没有对应路径 —— 点它、右键它都
+ * 得当成点在空白上。不然右键菜单里的「在资源管理器中显示」会拿着哨兵路径
+ * ('\x00rest')去请求后端。后端认得这是非法路径会挡掉(reveal.py 不收含 NUL
+ * 的路径),但让用户点出一个必然失败的菜单项没有意义。 */
+function cellTarget(cell) {
+  if (!cell || cell.item.synthetic) return null;
+  return cell.item;
+}
+
 function bindTreemap() {
   const canvas = el('treemap');
   const tip = el('tmTip');
@@ -502,6 +547,23 @@ function bindTreemap() {
     const total = treeTotal();
     const share = total ? (it.bytes / total * 100).toFixed(1) + '%' : '';
     clear(tip);
+
+    // 「本层其余」那一块:没有路径,也没有年龄可言,提示只说它是什么
+    if (it.synthetic) {
+      tip.appendChild(tag('div', { class: 'p' }, it.name));
+      const m = tag('div', { class: 'm' });
+      m.appendChild(tag('b', null, fmtBytes(it.bytes)));
+      if (share) m.appendChild(document.createTextNode(t('tm.shareOfLevel', { share: share })));
+      tip.appendChild(m);
+      tip.appendChild(tag('div', { class: 'm hint' },
+        it.foldedChildren
+          ? t('tm.restWithFolded', { n: fmtCount(it.foldedChildren) })
+          : t('tm.restHint')));
+      showTip(tip, ev);
+      canvas.style.cursor = 'default';
+      return;
+    }
+
     tip.appendChild(tag('div', { class: 'p' }, it.path || it.name));
     const meta = tag('div', { class: 'm' });
     meta.appendChild(tag('b', null, fmtBytes(it.bytes)));
@@ -529,26 +591,32 @@ function bindTreemap() {
 
   canvas.addEventListener('click', (ev) => {
     const r = canvas.getBoundingClientRect();
-    const cell = hitTest(ev.clientX - r.left, ev.clientY - r.top);
-    if (cell && cell.item.isDir) enterPath(cell.item.path);
+    const it = cellTarget(hitTest(ev.clientX - r.left, ev.clientY - r.top));
+    if (it && it.isDir) enterPath(it.path);
   });
 
   canvas.addEventListener('contextmenu', (ev) => {
     const r = canvas.getBoundingClientRect();
-    const cell = hitTest(ev.clientX - r.left, ev.clientY - r.top);
+    const it = cellTarget(hitTest(ev.clientX - r.left, ev.clientY - r.top));
     // 空白处右键当成对当前这一层操作,右键总有反应
     hideTip(el('tmTip'));
-    if (cell) showCtx(cell.item.path, cell.item.isDir, ev);
+    if (it) showCtx(it.path, it.isDir, ev);
     else showCtx(S.path, true, ev);
   });
 
   /* 用 ResizeObserver 而不是 window.resize:容器尺寸变化的原因不止窗口缩放
    * (后台标签页首次布局、字体加载后回流、横幅出现挤动布局),
-   * 而首绘量到 0 之后必须有人再叫一次,不然树图就一直是空的。 */
+   * 而首绘量到 0 之后必须有人再叫一次,不然树图就一直是空的。
+   *
+   * 这一次重叫不能排在 requestAnimationFrame 上:页面隐藏时 rAF 完全冻结
+   * (实测 hidden 状态下 600ms 都没跑,setTimeout 跑了),而「首绘量到 0」恰好
+   * 就发生在隐藏的时候。本机上实测过后果:面板在后台加载,画布位图停在默认的
+   * 300,CSS 宽 1207 —— 一个像素都没画。setTimeout 合并连续 resize 一样管用,
+   * 而且不冻结。 */
   let pending = 0;
   const ro = new ResizeObserver(() => {
     if (pending) return;
-    pending = requestAnimationFrame(() => { pending = 0; drawTreemap(false); });
+    pending = setTimeout(() => { pending = 0; drawTreemap(false); }, RESIZE_COALESCE_MS);
   });
   ro.observe(canvas.parentElement);
 }
@@ -579,32 +647,52 @@ function hideTip(tip) {
   tip.hidden = true;
 }
 
+/* 把一个盘内相对路径摊成面包屑的各级。纯函数,不碰 DOM —— tests/test_crumbs.py
+ * 直接在 node 里跑它。
+ *
+ * 每级的 path 必须是后端认的那种:反斜杠、不含盘符、根目录空串
+ * (schema.sql:31)。原来这里的累加器是 `acc = S.drive + '\\'` 起头、
+ * 分隔符后置,于是父级发出去的是 `C:\Users\` —— 盘符和尾部反斜杠都多了。
+ * get_dir() 查不到这个 key,而 get_tree() 对查不到的路径不报 404,
+ * 返回 node=null、children=[]:前端看到的是一次成功的空响应,画出来是
+ * 空图,表头还留着上一层的数字。表现就是「返回上级显示未扫描,只能回到
+ * 最上级才好」—— 根那一级发的是空串,是唯一合口径的一级。
+ *
+ * 现在只用 parts.slice(0, i+1).join('\\'),没有累加器可以带脏东西。
+ * 入参也顺手归一化:S.path 的来源不止一处(点方块、右键菜单、面包屑自己),
+ * 万一哪天有人喂进来一个全路径,在这里掐掉而不是发给后端。 */
+function crumbTrail(cur) {
+  const rel = String(cur || '').replace(/^[A-Za-z]:/, '').replace(/\//g, '\\');
+  const parts = rel.split('\\').filter(Boolean);
+  const trail = [{ label: null, path: '', current: parts.length === 0 }];
+  parts.forEach((p, i) => {
+    trail.push({
+      label: p,
+      path: parts.slice(0, i + 1).join('\\'),
+      current: i === parts.length - 1,
+    });
+  });
+  return trail;
+}
+
 function renderCrumbs() {
   const box = el('crumbs');
   clear(box);
   if (!S.drive) return;          // 还没选盘,别印出「null\」
-  const root = S.drive + '\\';
-  const mk = (label, path, active) => {
-    const btn = tag('button', { class: active ? 'crumb-current' : 'crumb' }, label);
-    if (!active) btn.addEventListener('click', () => enterPath(path));
+
+  const trail = crumbTrail(S.path);
+  trail.forEach((c, i) => {
+    if (i) box.appendChild(tag('span', { class: 'crumb-sep' }, '›'));
+    // 根那一级没有名字,显示盘符
+    const label = c.label === null ? S.drive + '\\' : c.label;
+    const btn = tag('button', { class: c.current ? 'crumb-current' : 'crumb' }, label);
+    if (!c.current) btn.addEventListener('click', () => enterPath(c.path));
     box.appendChild(btn);
-  };
-
-  const cur = S.path || '';
-  mk(root, '', cur === '');
-  if (!cur) {
-    box.appendChild(tag('span', { class: 'crumb-sep dim' }, t('tm.crumbHint')));
-    return;
-  }
-
-  const rel = cur.replace(/^[A-Za-z]:\\?/, '');
-  const parts = rel.split('\\').filter(Boolean);
-  let acc = S.drive + '\\';
-  parts.forEach((p, i) => {
-    acc = acc + p + (i < parts.length - 1 ? '\\' : '');
-    box.appendChild(tag('span', { class: 'crumb-sep' }, '›'));
-    mk(p, acc, i === parts.length - 1);
   });
+
+  if (trail.length === 1) {
+    box.appendChild(tag('span', { class: 'crumb-sep dim' }, t('tm.crumbHint')));
+  }
 }
 
 // ---- 时间轴 ----
@@ -687,6 +775,97 @@ function makeYAxis(peak, log, half) {
   return { toPx, ticks };
 }
 
+/* ---- 时间轴的坐标系 ----------------------------------------------------------
+ *
+ * 一份几何,三个地方用:画图、算「鼠标落在哪一天」、算「拖过去多少天」。
+ * 原来这三处各写一份,`W = 1000` 和 `{left: 64, right: 16}` 抄了三遍
+ * (第三遍还是字面量 `((1000 - 64 - 16) / 1000)`)—— 改一处另两处静默错位,
+ * 点击落到错的日子上、拖动速度和图对不上。
+ *
+ * viewBox 宽跟着宿主的实测像素宽走,也就是 1 单位 = 1 CSS 像素。
+ * 原来是死写的 `0 0 1000 260` 配 `preserveAspectRatio: none`,整张图靠 CSS
+ * 缩放填满容器 —— 于是图里所有东西都按 宿主宽/1000 缩,不只是字:3px 的窗口
+ * 指示轨、刻度线、柱子间距,全都一起变小。浏览器实测:
+ *
+ *     窗口 1265px → 宿主 1209px → 日期标签 12  px 高
+ *     窗口  820px → 宿主  749px → 日期标签 8.7 px 高
+ *     窗口  375px → 宿主  319px → 日期标签 3.3 px 高、9.5 px 宽,整图剩 83px 高
+ *
+ * app.css 里有 `@media (max-width: 940px)` 把版面收成单列,窄屏是特意支持过的。
+ */
+const TL_M = { top: 18, right: 16, bottom: 26, left: 64 };
+const TL_H = 260;
+/* 宿主再窄也按这个宽度画。绘图区宽度必须是正的 —— 负宽度的 rect 在 SVG 里
+ * 什么都不画,整张图会变成空白而不是「小」。 */
+const TL_MIN_W = 240;
+
+/* 合并连续 resize 的等待时间。跟一帧同量级,肉眼看不出延迟。
+ * 起个名字是因为它跟留白常量长得一样(都是 16),而结构测试会盯着
+ * bindTimelineZoom 里的字面量 —— 那是为了防止几何常量被再抄一遍。 */
+const RESIZE_COALESCE_MS = 16;
+
+/* 给定宿主的 CSS 像素宽,返回这一次要用的坐标系。hostW 由调用方量,
+ * 这个函数本身不碰 DOM(所以能在 node 里直接测)。 */
+function tlGeom(hostW) {
+  const W = Math.max(TL_MIN_W, Math.floor(hostW) || TL_MIN_W);
+  return {
+    W, H: TL_H, M: TL_M,
+    plotW: W - TL_M.left - TL_M.right,
+    plotH: TL_H - TL_M.top - TL_M.bottom,
+  };
+}
+
+/* 每隔几天标一个日期。
+ *
+ * 按「放得下几个」算,不是死写 12 个。原来是 `ceil(days / 12)`,跟宽度无关,
+ * 理由是「viewBox 是死的 1000,窄窗口时字和间距一起缩,相对关系不变」——
+ * 那个理由在 viewBox 跟着宽度走之后就不成立了:字不缩了,间距缩了,
+ * 12 个标签会叠在一起。
+ *
+ * 标签宽按语言取:.tl-day 是 10px 等宽字,"08-25" 实测占 30 上下,
+ * "Aug 25" 占 39 —— 英文更宽,阈值也得更大。
+ *
+ * 上限 12:宽窗口下把 90 个日期全标上是另一种看不清。 */
+function tlLabelStride(plotW, dayCount, lang) {
+  const labelW = lang === 'en' ? 44 : 38;
+  const fits = Math.max(2, Math.floor(plotW / labelW));
+  return Math.max(1, Math.ceil(dayCount / Math.min(12, fits)));
+}
+
+/* 屏幕上的 x(相对图左边缘的像素)落在哪一天,返回 days 里的下标。
+ *
+ * 和画柱子用的是同一份几何,这一点是这个函数存在的全部理由:原来这段算法
+ * 抄在 bindTimelineZoom 的闭包里,自己写着 W = 1000,和 renderTimeline 各算
+ * 一份 —— 两边一旦不一致,点击就落到错的日子上,而这种错没有任何报错,
+ * 只是「点这根柱子弹出来的是隔壁那天」。
+ *
+ * hostPx 是宿主的真实像素宽,单独给:宿主窄到 TL_MIN_W 以下时 viewBox 被夹住,
+ * 屏幕像素和 viewBox 单位之间就有个缩放系数,得先换算回来。
+ *
+ * 该满足的性质是往返一致:把某一天柱子的中心 x 喂回来,得回到那一天。
+ * tests/test_timeline_geometry.py 里按这个性质测。 */
+function tlDayAt(x, hostPx, from, to) {
+  if (!(to > from) || !(hostPx > 0)) return null;
+  const g = tlGeom(hostPx);
+  const vx = (x / hostPx) * g.W;              // 屏幕像素 → viewBox 单位
+  const frac = (vx - g.M.left) / g.plotW;
+  /* floor 而不是 round。问的是「光标落在哪一格」,round 回答的是「离哪条格线
+   * 最近」—— 每一格的右半边都会被算到下一天去。第 i 格的中心是 i + 0.5,
+   * round 直接进到 i + 1,往返对不上。
+   *
+   * 这个 off-by-one 是原来就有的(只是没人往返验过):dayAt 只喂给滚轮缩放的
+   * 锚点,光标在格子右半边时锚在隔壁那天,滚一下画面就偏一格。 */
+  const idx = from + Math.floor(frac * (to - from));
+  return Math.max(from, Math.min(to - 1, idx));
+}
+
+/* 第 i 天(相对 from 的偏移)那根柱子的中心,viewBox 单位。
+ * renderTimeline 画柱子和 tlDayAt 反推都得用它,不然两边会飘。 */
+function tlBarCenter(i, geom, dayCount) {
+  const slot = geom.plotW / Math.max(1, dayCount);
+  return geom.M.left + i * slot + slot / 2;
+}
+
 /* 当前可见的下标区间。没缩放时就是整个数组。 */
 function tlWindow() {
   const total = (S.timeline && S.timeline.days) ? S.timeline.days.length : 0;
@@ -757,12 +936,33 @@ function renderTimeline() {
   // 每次都从零线长一遍的话画面一直在抖,反而看不清。
   const animate = !REDUCED && !S.tlAnimated;
   S.tlAnimated = true;
-  const W = 1000, H = 260;
-  const M = { top: 18, right: 16, bottom: 26, left: 64 };
-  const plotW = W - M.left - M.right;
-  const plotH = H - M.top - M.bottom;
+
+  /* 宽度量外壳,不量 svg 自己:svg 的渲染高度由 viewBox 宽高比推出来,而
+   * viewBox 正是下面要设的 —— 量自己就是自己算自己。外壳是普通 div,宽度只由
+   * CSS 决定。drawTreemap 量的也是 `canvas.parentElement`。
+   *
+   * 「量不到」和「很窄」是两件事,界不一样。TL_MIN_W(240)是给真的很窄的宿主
+   * 兜底的;量到 0 说的是「布局还没算出来」,这时候按 240 画出去,就是拿一个
+   * 凑合的数当真 —— 第一版就是这么错的:后台标签页里加载,量到 0 退到 240,
+   * viewBox 写成 `0 0 240 260`,而外壳 CSS 宽 749px,于是整张图被放大 3.1 倍,
+   * 日期标签渲染成 36px 高、91px 宽。方向和原来的 bug 相反,病根一样。
+   *
+   * 所以量不到就先不画,等 ResizeObserver 拿到真尺寸再来一次。摘要和缩放按钮
+   * 照画:它们跟宽度无关,跳过会让按钮的禁用状态停在上一次。 */
+  const hostW = shell ? shell.clientWidth : 0;
+  if (hostW < 2) {
+    renderTimelineSummary();
+    renderTlZoom();
+    return;
+  }
+  // 记下这次用的宽度,让 observer 能判断「宽度真变了没」
+  const geom = tlGeom(hostW);
+  const { W, H, M, plotW, plotH } = geom;
+  S.tlW = W;
 
   host.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  /* 宽高和 viewBox 一比一,所以 none 和默认值在这儿是一回事。留着是因为
+   * 万一哪天 CSS 给了个别的高度,这里假设的是拉伸而不是留黑边。 */
   host.setAttribute('preserveAspectRatio', 'none');
 
   /* 斜纹图案,两种 basis 各一份,颜色不同。
@@ -879,17 +1079,10 @@ function renderTimeline() {
    * 是最常看的一格),所以倒数第二个刻度离它太近时让路 —— 不然
    * 「08-25 08-27」会叠在一起糊成一团。
    *
-   * 标签宽度按语言取:这里的坐标是 viewBox 单位(固定 1000 宽),不是屏幕
-   * 像素。.tl-day 在 viewBox 里约 10 单位高,"08-25" 实测占 30 上下,
-   * "Aug 25" 占 39 —— 英文更宽,所以让路的阈值也得更大,否则英文下
-   * 「Aug 25 Aug 27」会贴在一起。
-   *
-   * 只按语言分,不按窗口宽度分:viewBox 是死的 1000,整张图靠 CSS 缩放,
-   * 所以窗口变窄时字和间距一起缩,标签之间的相对关系不变 —— 按 plotW 算
-   * 「放得下几个」永远得到同一个数。(缩到手机宽度时字会小到看不清,那是
-   * 固定 viewBox 的老问题,不是标签数量能解决的。) */
+   * 间隔和让路阈值都从 tlLabelStride 那套口径来:坐标现在是 1 单位 = 1 CSS
+   * 像素,所以「标签占多宽」是个真实的像素数,能直接和槽宽比。 */
   const labelW = I18N.lang === 'en' ? 44 : 38;
-  const stride = Math.max(1, Math.ceil(days.length / 12));
+  const stride = tlLabelStride(plotW, days.length, I18N.lang);
   const last = days.length - 1;
   const crowded = (last % stride) * slot < labelW;
   const gLab = svg('g');
@@ -900,7 +1093,8 @@ function renderTimeline() {
       if (crowded && i + stride > last) return;
     }
     const label = svg('text', {
-      x: (M.left + i * slot + slot / 2).toFixed(2),
+      // 和 tlDayAt 反推时用的是同一个中心公式,不然标签和它对应的那天会飘
+      x: tlBarCenter(i, geom, days.length).toFixed(2),
       y: H - 8, class: 'tl-day', 'text-anchor': 'middle',
     });
     label.textContent = fmtDayISO(d.day);
@@ -976,19 +1170,14 @@ function bindTimelineZoom() {
   const plot = el('timeline');
   if (!host || !plot) return;
 
-  // 从鼠标位置反推它落在哪一天(days 数组的下标)
+  // 从鼠标位置反推它落在哪一天(days 数组的下标)。算法在 tlDayAt,这里只量。
   const dayAt = (clientX) => {
     const tl = S.timeline;
     if (!tl || !tl.days || !tl.days.length) return null;
     const r = plot.getBoundingClientRect();
     if (!r.width) return null;
     const [from, to] = tlWindow();
-    // viewBox 是 0..1000,左右留白按同一比例换算
-    const M_LEFT = 64, M_RIGHT = 16, W = 1000;
-    const vx = ((clientX - r.left) / r.width) * W;
-    const frac = (vx - M_LEFT) / (W - M_LEFT - M_RIGHT);
-    const idx = from + frac * (to - from);
-    return Math.max(from, Math.min(to - 1, Math.round(idx)));
+    return tlDayAt(clientX - r.left, r.width, from, to);
   };
 
   /* 滚轮缩放。这里要 preventDefault 挡掉页面滚动,所以监听器必须
@@ -1018,8 +1207,9 @@ function bindTimelineZoom() {
     if (!drag) return;
     const r = plot.getBoundingClientRect();
     if (!r.width) return;
-    // 拖过去多少像素,换算成多少天
-    const perDay = r.width * ((1000 - 64 - 16) / 1000) / drag.span;
+    // 拖过去多少屏幕像素,换算成多少天。绘图区占宿主的比例从 tlGeom 拿。
+    const g = tlGeom(plot.clientWidth || r.width);
+    const perDay = r.width * (g.plotW / g.W) / drag.span;
     const moved = Math.round((drag.x - ev.clientX) / perDay);
     const total = S.timeline.days.length;
     const next = clampView({ start: drag.start + moved, span: drag.span }, total);
@@ -1076,6 +1266,39 @@ function bindTimelineZoom() {
       renderTimeline();
     });
   });
+
+  /* 宽度变了要重画。以前不用:viewBox 是死的,整张图靠 CSS 缩放,窗口一变
+   * 浏览器自己就按新尺寸拉一遍,一行 JS 都不需要。改成按像素画之后就得自己管了。
+   *
+   * 只在宽度真的变了才画。renderTimeline 改的是 viewBox 高度,而 SVG 的渲染高度
+   * 由 viewBox 的宽高比推出来 —— 也就是说重画会改宿主的高度,又触发 observer。
+   * 不比一下宽度就是个无限循环。
+   *
+   * 合并连续的 resize:拖窗口边缘一秒能触发几十次,每次都重画
+   * (90 根柱子 + 命中区 + 标签,全是 DOM 节点)会卡。
+   *
+   * 用 setTimeout 而不是 requestAnimationFrame。页面隐藏时 rAF 完全冻结,
+   * 浏览器里实测过:hidden 状态下 rAF 排的回调 600ms 都没跑,setTimeout 跑了。
+   * 而首绘量到 0 就是靠这次重叫补上的 —— 排在 rAF 上,后台标签页里加载的页面
+   * 时间轴会一直空着(实测:外壳已经 1029px,viewBox 还是 null)。
+   *
+   * 按规范 rAF 回调只是推迟、页面一显示就跑,应该能自愈。但这条路在这儿没法
+   * 验证,而这张图原来根本不依赖它(viewBox 死的,CSS 缩放,零 JS)—— 是改成
+   * 按像素画才引入的。合并用 setTimeout 一样管用,那就别留这个不确定性。 */
+  let pendingW = 0;
+  const ro = new ResizeObserver(() => {
+    if (pendingW) return;
+    pendingW = setTimeout(() => {
+      pendingW = 0;
+      if (!S.timeline) return;
+      // 和 renderTimeline 量同一个东西(外壳),不然两边的判断会对不上
+      const w = host.clientWidth;
+      if (w < 2) return;
+      if (tlGeom(w).W === S.tlW) return;
+      renderTimeline();
+    }, RESIZE_COALESCE_MS);
+  });
+  ro.observe(host);
 }
 
 /* 「7 天 / 14 天 / 30 天」。数字在 data-span 上,文案在这儿拼 ——
@@ -1300,18 +1523,27 @@ function renderHotspots() {
     }
   }
 
-  const tmTotals = el('treemapTotals');
-  if (tmTotals) {
-    clear(tmTotals);
-    // 同上:别叫 t,那是取文案的全局函数
-    const total = treeTotal();
-    if (total) {
-      tmTotals.appendChild(tag('span', { class: 'dim' }, t('tm.thisLevel')));
-      tmTotals.appendChild(tag('b', null, fmtBytes(total)));
-      const n = (S.tree.children || []).length;
-      tmTotals.appendChild(tag('span', { class: 'dim' }, t('grid.itemCount', { n: n })));
-    }
-  }
+  renderTreemapTotals();
+}
+
+/* 树图上方那行「本层 x GB · n 项」。
+ *
+ * 单独一个函数,因为它讲的是 S.tree(当前这一层),而不是 S.hotspots(整盘)。
+ * 原来它写在 renderHotspots 里,而进目录只调 drawTreemap —— 画布换了、
+ * 这行没换,屏幕上一半是新目录的图、一半是上一层的数字。
+ * 拆出来之后 enterPath 只重画这一行,不用连整个热点面板一起重画。 */
+function renderTreemapTotals() {
+  const box = el('treemapTotals');
+  if (!box) return;
+  clear(box);
+  if (!S.tree) return;
+  // 别叫 t,那是取文案的全局函数
+  const total = treeTotal();
+  if (!total) return;
+  box.appendChild(tag('span', { class: 'dim' }, t('tm.thisLevel')));
+  box.appendChild(tag('b', null, fmtBytes(total)));
+  const n = (S.tree.children || []).length;
+  box.appendChild(tag('span', { class: 'dim' }, t('grid.itemCount', { n: n })));
 }
 
 /* 后端给的口径说明:{code, vars}。文案在 i18n.js 里按 diff.caveat.<code> 取。
@@ -1335,8 +1567,26 @@ function renderDiff(diff) {
   const notice = el('diffNotice');
 
   if (!diff || !diff.available) {
-    // 只有一次快照时整段藏起来:空表格比不显示更让人困惑
-    if (section) section.hidden = true;
+    // 原来这里整段藏起来,理由是「空表格比不显示更让人困惑」—— 对,但后端
+    // 同时也送了一句 reason(api.py:270「至少要两次扫描才能对比」),
+    // 藏掉整段那句话就永远到不了用户眼前。写了却到不了的文案和没写一样。
+    //
+    // 现在:表格还是不摆(空的两列确实没意义),但把原因留在标题下面。
+    // 第一次用的人正需要这句 —— 再扫一次就有对比了,不说他不会知道。
+    if (section) section.hidden = false;
+    if (range) range.textContent = '';
+    if (net) clear(net);
+    if (notice) {
+      clear(notice);
+      // 不用后端送来的 diff.reason:那是生中文,英文界面下会漏出来。
+      // 这里只有一种情况(快照不够两个),用本地文案就够了 —— 和
+      // diff.caveat.* 那批一样,后端管判定,文案归前端。
+      notice.appendChild(tag('div', { class: 'notice' }, t('diff.needTwo')));
+    }
+    // 空态不能用 diff.noGrow(「没有目录变大」)—— 那是在陈述一次根本没发生
+    // 的比较的结论。没比过和比过没发现,是两回事。
+    fillRows('grewBody', [], t('diff.notYet'));
+    fillRows('shrankBody', [], t('diff.notYet'));
     return;
   }
   if (section) section.hidden = false;
@@ -1373,9 +1623,44 @@ function renderChanges(ch) {
   const events = (ch && ch.events) || [];
   const deletes = events.filter((e) => e.kind === 'delete');
 
-  // 日志读不到就整段藏掉,别摆一张空表让人以为「什么都没删过」
+  // 0 条事件有三种原因,以前一律藏掉 —— 意图是「别摆一张空表让人以为什么都
+  // 没删过」,但顺手也把「没提权」藏了。不提权时后端整段跳过 USN
+  // (app.py 里的 privileges.is_admin() 门槛),库里永远 0 条,于是这个功能
+  // 对非管理员用户根本不存在,而且不给任何提示。实测:同一台机器直读日志
+  // 有 8 万条该入库,库里是 0。
+  //
+  // 现在分三种:
+  //   没权限            → 露出来说要提权
+  //   有权限但读失败    → 露出来说为什么。NTFS 上 USN 日志可以关,不少机器默认
+  //                       就是关的;藏起来的话跟「什么都没删过」长得一模一样
+  //   有权限、读成了、真空 → 照旧藏
   if (!cov.events) {
-    if (section) section.hidden = true;
+    const isAdmin = !!((S.status && S.status.privileges || {}).is_admin);
+    // 后端读失败时会把原因存进 usn_status,coverage 带出来。available 有三态:
+    // true 读成了、false 读失败、null 这个盘没扫过(别把没扫过说成故障)。
+    const failed = cov.available === false;
+    // 没提权时先说提权:那是用户能动手解决的那一个,而且不提权时后端整段跳过
+    // USN、连 usn_status 都不写,两个条件会同时成立 —— 这时候讲「日志没开」
+    // 是误导。
+    if (isAdmin && !failed) {
+      if (section) section.hidden = true;
+      return;
+    }
+    if (section) section.hidden = false;
+    const covBox0 = el('usnCoverage');
+    if (covBox0) clear(covBox0);
+    const notice0 = el('usnNotice');
+    if (notice0) {
+      clear(notice0);
+      notice0.appendChild(tag('div', { class: 'notice' }, isAdmin
+        // 具体原因是后端给的(日志没开 / 读取失败 / 设备没准备好),原样带出来 ——
+        // 前端猜不出是哪种,猜错了比不说更糟
+        ? t('del.unavailable', { why: cov.reason || t('del.unavailableUnknown') })
+        : t('del.needAdmin')));
+    }
+    // 表格空态要短。长的解释在上面那条 notice 里,两处都写整段就重复了。
+    fillRows('deletedBody', [],
+             isAdmin ? t('del.unavailableRow') : t('del.needAdminRow'));
     return;
   }
   if (section) section.hidden = false;
@@ -1392,6 +1677,10 @@ function renderChanges(ch) {
   if (notice) {
     clear(notice);
     const unknown = deletes.filter((e) => e.bytes === null || e.bytes === undefined).length;
+    // 只有名字、没有路径的行。日志记的是文件 ID,要靠扫描时的目录表反查成路径 ——
+    // 整棵目录树在扫描前就没了的话,反查不出来。实盘上 D: 盘 32031 条删除里
+    // 只有 450 条能反查到路径,剩下的就是这种。
+    const noloc = deletes.filter((e) => !e.path).length;
     const note = tag('div', { class: 'notice' });
     // 这句原来是后端送过来的,现在在这边出 —— 它没有后端才知道的参数
     note.appendChild(document.createTextNode(t('del.sizeNote')));
@@ -1399,16 +1688,47 @@ function renderChanges(ch) {
       note.appendChild(document.createTextNode(
         t('del.unknownSize', { n: fmtCount(unknown) })));
     }
+    if (noloc) {
+      note.appendChild(document.createTextNode(
+        t('del.noPathNote', { n: fmtCount(noloc) })));
+    }
     if (note.childNodes.length) notice.appendChild(note);
   }
 
-  fillRows('deletedBody', deletes.map((e) => [
-    // 已经删掉的文件:标成文件,右键菜单里「打开上一级目录」才是能用的那一项
-    pathCell(e.path || e.name, null, true),
-    { text: (e.bytes === null || e.bytes === undefined) ? t('age.unknown') : fmtBytes(e.bytes),
-      attrs: { class: 'num ' + ((e.bytes === null || e.bytes === undefined) ? 'dim' : 'shrink') } },
-    { text: fmtTime(e.at), attrs: { class: 'num dim' } },
-  ]), t('del.none'));
+  fillRows('deletedBody', deletes.map((e) => {
+    // 后端按路径把同一个文件的多条 USN 记录合成了一行,count 是折叠掉的条数。
+    // >1 就标出来:反复重建的临时文件能攒到上百次,而那件事跟「丢了个东西」
+    // 完全是两回事,不该让它看起来一样。老后端不送这个字段,当 1 处理。
+    const n = e.count > 1 ? e.count : 0;
+    // 路径反查不出来的行,拿到的只有文件名。这种行得跟真路径区分开,有两个原因:
+    //
+    // 一、名字会重。实盘上 problems-report.html 出现 5 次、classes 5 次 ——
+    //     它们是不同目录里的不同文件,可界面上看着一模一样,像是列表出了毛病。
+    //     (不能按名字合并:那 5 个真的是 5 个文件,合并等于凭空说是一个。)
+    //
+    // 二、右键菜单会撒谎。它把这一格的文字当盘内相对路径,拼出来是
+    //     「D:\problems-report.html」并且印在菜单顶上 —— 那个位置这文件从来没待过。
+    //     所以不给 data-file 标记,让 bindCtxMenu 直接跳过这种行。
+    const known = !!e.path;
+    const cell = pathCell(
+      e.path || e.name,
+      [known ? null : t('del.noPathRow'),
+       n ? t('del.timesNote', { n: fmtCount(n) }) : null].filter(Boolean).join('\n') || null,
+      known,
+    );
+    if (!known) {
+      cell.attrs['data-noloc'] = '1';
+      cell.attrs.class += ' dim';
+    }
+    return [
+      cell,
+      { text: (e.bytes === null || e.bytes === undefined) ? t('age.unknown') : fmtBytes(e.bytes),
+        attrs: { class: 'num ' + ((e.bytes === null || e.bytes === undefined) ? 'dim' : 'shrink') } },
+      // 次数跟在时间后面:它限定的正是这个时间的含义 —— 最后一次,不是唯一一次
+      { text: fmtTime(e.at) + (n ? ' ' + t('del.times', { n: fmtCount(n) }) : ''),
+        attrs: { class: 'num dim' } },
+    ];
+  }), t('del.none'));
 }
 
 // ---- 扫描 ----
@@ -1421,7 +1741,9 @@ function setScanState(state) {
   const running = !!(state && state.running);
   if (btn) {
     btn.disabled = running;
-    btn.classList.toggle('pulse', running);
+    // 不是 'pulse' 了。那个类带 width/height/border-radius:50%,加到按钮上会把
+    // 按钮本身压成一个椭圆点,文字从里面溢出来。scanning 只改颜色,不碰尺寸。
+    btn.classList.toggle('scanning', running);
     btn.textContent = running ? t('scan.running') : t('nav.scan');
   }
   if (!label) return;
@@ -1434,7 +1756,13 @@ function setScanState(state) {
   const other = state && state.drive && state.drive !== S.drive ? state.drive + ' ' : '';
   if (running) {
     const phase = state.phase || t('scan.inProgress');
-    label.appendChild(tag('span', null, t('scan.phase', { drive: state.drive || '', phase: phase })));
+    // 有条数就报条数。原来后端根本没在报(progress 没接线),这一行整次扫描
+    // 一动不动 —— 一分多钟里唯一的动静是按钮上那个转圈,不知道它在干什么。
+    const counted = state.counted || 0;
+    const key = counted > 0 ? 'scan.phaseCounted' : 'scan.phase';
+    label.appendChild(tag('span', null, t(key, {
+      drive: state.drive || '', phase: phase, n: counted,
+    })));
     label.hidden = false;
   } else if (state && state.error) {
     label.appendChild(tag('span', { class: 'bad' }, other + t('scan.failed') + state.error));
@@ -1455,30 +1783,79 @@ function setScanState(state) {
   }
 }
 
+/* 不变量:后端说在扫,就必须有一个定时器在盯着。
+ *
+ * 原来 setInterval 只写在 startScan 里,于是三种情况下界面会永久停在
+ * 「扫描中」—— 刷新页面时正在扫(boot() 只 await 一次就返回了)、
+ * POST 撞上 409(计划任务或第二个标签页在扫,异常落进 catch)、
+ * 以及轮询自己失败清掉了定时器而扫描还在跑。
+ *
+ * 所以改成:凡是看到 running,就确保定时器在;建之前先查有没有,
+ * 连点按钮也不会叠出第二个。 */
+function ensureScanPolling() {
+  if (S.scanPoll) return;
+  S.scanPoll = setInterval(pollScan, 1200);
+}
+
+function stopScanPolling() {
+  if (S.scanPoll) { clearInterval(S.scanPoll); S.scanPoll = null; }
+}
+
+/* 取一次状态失败不代表扫描停了 —— 后台线程照样在跑,这时候放弃轮询等于
+ * 把界面永久钉在最后看到的样子。所以容忍几次,连着失败才认为服务真的没了。
+ * 上限要小:1.2 秒一次,5 次就是 6 秒,足够跨过一次网络抖动,又不会对着
+ * 一个已经关掉的后端一直打。 */
+const SCAN_POLL_MAX_ERRORS = 5;
+
 async function pollScan() {
   try {
     const state = await api('/api/scan/state');
+    S.scanPollErrors = 0;
     setScanState(state);
-    if (state.running) return true;
-    if (S.scanPoll) { clearInterval(S.scanPoll); S.scanPoll = null; }
-    await loadDrive(S.drive, { keepPath: true });
+    if (state.running) { ensureScanPolling(); return true; }
+    /* 只有刚才真在轮询,才说明有一次扫描刚结束、需要重新取数。
+     *
+     * boot() 末尾也会调一次 pollScan(为了接住别处已经在跑的扫描:计划任务、
+     * 命令行、另一个标签页),而它上一行刚 loadDrive 过。原来这里无条件重载,
+     * 于是每次开页面整份数据都抓两遍 —— 网络面板上 status ×3,timeline/tree/
+     * hotspots/diff/changes 各 ×2。C: 那几个接口要查 16 万行 dirs,白跑一遍,
+     * 两轮之间界面还闪一下。
+     *
+     * S.scanPoll 是现成的判据,不用另加状态:boot 调进来时它是 null,
+     * 定时器那一路和 startScan 那一路都非 null。 */
+    const wasPolling = !!S.scanPoll;
+    stopScanPolling();
+    if (wasPolling) await loadDrive(S.drive, { keepPath: true });
     return false;
   } catch (err) {
-    if (S.scanPoll) { clearInterval(S.scanPoll); S.scanPoll = null; }
-    setScanState({ error: err.message });
-    return false;
+    S.scanPollErrors = (S.scanPollErrors || 0) + 1;
+    if (S.scanPollErrors >= SCAN_POLL_MAX_ERRORS) {
+      stopScanPolling();
+      S.scanPollErrors = 0;
+      setScanState({ error: err.message });
+      return false;
+    }
+    // 还没到上限:留着定时器,下一轮再试。这一次的失败不往界面上写 ——
+    // 抖一下就闪一行红字,比不显示更让人以为出事了。
+    ensureScanPolling();
+    return true;
   }
 }
 
 async function startScan() {
+  setScanState({ running: true, drive: S.drive });
   try {
-    setScanState({ running: true, drive: S.drive });
     await post('/api/scan', { drive: S.drive });
-    if (S.scanPoll) clearInterval(S.scanPoll);
-    S.scanPoll = setInterval(pollScan, 1200);
   } catch (err) {
-    setScanState({ error: err.message });
+    /* 最常见的失败就是 409「已经有一次扫描在进行中」—— 那恰恰说明有东西在扫,
+     * 正是最需要轮询的时候。所以不管成没成,都去查一次真实状态:
+     * 真在扫就跟着刷,真没扫才把错误显示出来。 */
+    ensureScanPolling();
+    const running = await pollScan();
+    if (!running) setScanState({ error: err.message });
+    return;
   }
+  ensureScanPolling();
 }
 
 // ---- 计划任务 ----
@@ -1552,42 +1929,87 @@ async function toggleSchedule() {
 }
 
 // ---- 载入 ----
+
+/* 每次载入领一个号,写回 S 之前先看自己的号还是不是最新的。
+ *
+ * 六个请求各自 .then 往 S 上写,谁后回来谁说了算 —— 而「谁后回来」跟
+ * 「谁是用户最后要的」没有关系。pollScan 扫完会调 loadDrive,用户正好这时候
+ * 切了盘或者点进一层目录,两批响应交错:S.drive 已经是 D: 了,而 C: 那批
+ * 慢响应回来把树盖成 C: 的。屏幕上就是盘符、基线、树图三处各说各话,
+ * 或者干脆一片空白 —— 用户说的「结果时不时就没了」。
+ *
+ * 号只在这两个入口领。别的地方(renderX)不写 S 的数据字段,不需要管。 */
+function newLoadToken() {
+  S.loadSeq = (S.loadSeq || 0) + 1;
+  return S.loadSeq;
+}
+
+function isCurrentLoad(token) {
+  return token === S.loadSeq;
+}
+
 async function enterPath(path) {
+  const token = newLoadToken();
   S.path = path;
   renderCrumbs();
   try {
-    S.tree = await api('/api/tree', { drive: S.drive, path: path || null, depth: 1 });
+    const tree = await api('/api/tree', { drive: S.drive, path: path || null });
+    if (!isCurrentLoad(token)) return;   // 用户已经去别处了,这份数据过期了
+    S.tree = tree;
     S.fade.clear();
     drawTreemap(false);
+    // 表头跟画布是同一份数据的两半,必须一起换。原来这儿不调,于是进目录之后
+    // 画布换了、表头还是上一层的数字,读起来像「数据还在只是图没了」。
+    renderTreemapTotals();
   } catch (err) {
+    if (!isCurrentLoad(token)) return;
     banner({ text: err.message });     // 后端抛的原文,翻不了
   }
 }
 
 async function loadDrive(drive, opts) {
+  const token = newLoadToken();
   S.drive = drive;
   if (!opts || !opts.keepPath) { S.path = ''; S.fade.clear(); }
   // 换盘就复位缩放:C: 上第 40 天的窗口套到 D: 上没有任何意义
   S.tlView = null;
   S.tlAnimated = false;
+  const path = S.path || null;
   renderDriveTabs();
   renderBaseline();
   if (S.scan) setScanState(S.scan);   // 「是哪个盘扫的」那个前缀要按新的 S.drive 重算
 
+  /* 每个 .then 都先验号。不能只在最后验一次:六个请求各写一个字段,
+   * 中间任何一个漏了验,那个字段就会是旧盘的。 */
+  const keep = (fn) => (r) => { if (isCurrentLoad(token)) fn(r); };
+
+  /* 基线数字必须跟着重取。S.drives 原来只在开机时填一次,之后再没动过 ——
+   * 于是扫完一个盘,上面那行还是「尚无快照」,扫到/文件/快照个数和口径说明
+   * 全都不出现,非得刷新页面才对。而下面的时间轴已经是新数据了,同一屏上
+   * 两半自相矛盾。换盘也一样:开着页面扫完 D: 再切过去,看到的是空的。
+   *
+   * 但开页面那一次是白取的:boot() 必须先自己取一遍(挑哪个盘、要不要弹
+   * 「不是管理员」都靠它),下一句就调这里,于是 /api/status 请求两遍。
+   * get_status 按盘数干活 —— 每个盘 latest_snapshot + volume_space(Win32,
+   * 盘不在时还得等它失败)+ list_snapshots(limit=10000) 拉出来数个数 +
+   * usn_coverage,外加一次 db_size_bytes。
+   *
+   * 所以让调用方说一声「我手上这份是刚取的」,而不是把这一路删掉:换盘和
+   * 扫完刷新都必须重取,snapshot_count 刚变了。 */
   const jobs = [
-    // 基线数字必须跟着重取。S.drives 原来只在开机时填一次,之后再没动过 ——
-    // 于是扫完一个盘,上面那行还是「尚无快照」,扫到/文件/快照个数和口径说明
-    // 全都不出现,非得刷新页面才对。而下面的时间轴已经是新数据了,同一屏上
-    // 两半自相矛盾。换盘也一样:开着页面扫完 D: 再切过去,看到的是空的。
-    api('/api/status').then((r) => { S.status = r; S.drives = r.drives || []; }),
-    api('/api/timeline', { drive, days: 90 }).then((r) => { S.timeline = r; }),
-    api('/api/tree', { drive, path: S.path || null }).then((r) => { S.tree = r; }),
-    api('/api/hotspots', { drive }).then((r) => { S.hotspots = r; }),
-    api('/api/diff', { drive }).then(renderDiff, () => renderDiff(null)),
+    ...(opts && opts.keepStatus ? [] : [
+      api('/api/status').then(keep((r) => { S.status = r; S.drives = r.drives || []; })),
+    ]),
+    api('/api/timeline', { drive, days: 90 }).then(keep((r) => { S.timeline = r; })),
+    api('/api/tree', { drive, path }).then(keep((r) => { S.tree = r; })),
+    api('/api/hotspots', { drive }).then(keep((r) => { S.hotspots = r; })),
+    api('/api/diff', { drive }).then(keep(renderDiff), keep(() => renderDiff(null))),
     api('/api/changes', { drive, kind: 'delete', limit: 200 })
-      .then(renderChanges, () => renderChanges(null)),
+      .then(keep(renderChanges), keep(() => renderChanges(null))),
   ];
   const results = await Promise.allSettled(jobs);
+  if (!isCurrentLoad(token)) return;
+
   const failed = results.filter((r) => r.status === 'rejected');
   if (failed.length) banner({ text: failed[0].reason.message });
 
@@ -1791,8 +2213,41 @@ function bindCtxMenu() {
     if (!cell) return;
     const rel = (cell.textContent || '').trim();
     if (!rel) return;
+    // 只有名字、没有路径的行不给菜单。这一格的文字是个裸文件名,当成盘内相对
+    // 路径拼出来是「D:\那个名字」—— 菜单顶上就印这个,而文件从来没在那儿。
+    // 报错也不对:reveal 会说「这个路径已经不在了(可能在上次扫描之后被删了)」,
+    // 而真相是从来不知道它在哪。宁可不给菜单,也别给个假位置。
+    if (cell.dataset.noloc === '1') return;
     // 清理表和大目录表都是目录;文件明细表标了 data-file
     showCtx(rel, cell.dataset.file !== '1', ev);
+  });
+}
+
+/* 页面重新可见时把两张按尺寸画的图补一刀。
+ *
+ * 隐藏期间浏览器不跑渲染步骤,而 ResizeObserver 的派发就挂在那一步上 ——
+ * 实测:隐藏状态下新建 observer 并 observe 一个元素,连首次观测都不派发;
+ * 期间把宽度从 100 改到 400 也照样不派发(两次计数都是 0)。requestAnimationFrame
+ * 同样冻结(600ms 没跑,setTimeout 跑了)。
+ *
+ * 于是在后台标签页里加载完的页面,两张图都是空的:外壳已经量到 1029px,
+ * 时间轴的 viewBox 还是 null,树图的画布位图停在默认的 300。而它俩「量到 0 就
+ * 先不画」正是靠 observer 回头再叫一次 —— 那一次在隐藏期间不会来。
+ *
+ * 按规范 RO 比的是「当前尺寸 vs 上次上报的尺寸」(状态比较,不是回调队列),
+ * 隐藏期间的变化不该丢,页面一显示就会补派发。但这条路没法在这儿验证 ——
+ * 预览面板没办法弄成可见。而这两张图原来根本不依赖它:viewBox 是死的,整张图
+ * 靠 CSS 缩放,窗口一变浏览器自己就重新拉一遍,一行 JS 都不用。这个依赖是
+ * 「按像素画」引入的,那就自己补上,不赌规范怎么写。
+ *
+ * 补多了不要紧:两个渲染函数都是幂等的,宽度没变的话画出来一模一样。 */
+function bindVisibilityRepaint() {
+  document.addEventListener('visibilitychange', () => {
+    // 只管「变可见」这个方向。变隐藏时量不到尺寸,跑一遍是白跑。
+    if (document.hidden) return;
+    if (S.timeline) renderTimeline();
+    // false:不播生长动画。切回标签页不是换数据,方块该待在原地。
+    if (S.tree) drawTreemap(false);
   });
 }
 
@@ -1811,7 +2266,7 @@ function repaintAll() {
   if (S.scan) setScanState(S.scan);
   if (S.timeline) { renderTimeline(); renderLegend(); }
   renderCrumbs();
-  if (S.tree) drawTreemap(false);
+  if (S.tree) { drawTreemap(false); renderTreemapTotals(); }
   if (S.hotspots) renderHotspots();
   renderDiff(S.diff);
   renderChanges(S.changes);
@@ -1832,6 +2287,7 @@ async function boot() {
   bindTreemap();
   bindCtxMenu();
   bindTimelineZoom();
+  bindVisibilityRepaint();
   const scanBtn = el('scanBtn');
   if (scanBtn) scanBtn.addEventListener('click', startScan);
   const toggle = el('scheduleToggle');
@@ -1859,7 +2315,8 @@ async function boot() {
   if (firstRun) firstRun.hidden = total > 0;
 
   const withData = S.drives.find((d) => d.snapshot_count > 0);
-  await loadDrive((withData || S.drives[0]).drive);
+  // keepStatus:上面那句 await 刚取过,S.status/S.drives 是这一刻最新的
+  await loadDrive((withData || S.drives[0]).drive, { keepStatus: true });
   await loadSchedule();
   await pollScan();
 }
