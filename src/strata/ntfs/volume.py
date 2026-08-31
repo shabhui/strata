@@ -251,6 +251,48 @@ class Volume:
         head = offset - start
         return raw[head : head + length]
 
+    def read_into(self, offset: int, length: int, buf: bytearray) -> int:
+        """读进调用方给的缓冲区,返回实际读到的字节数。
+
+        跟 read() 的区别是不新分配。read() 一次调用要过四遍内存:
+        create_string_buffer 分配并填零、buf.raw[:n] 拷一份、
+        raw[head:head+length] 再切一份,调用方通常还要 bytearray() 一遍。
+        整个 MFT 走下来是 8 MiB × 4 × 196 块 ≈ 6.3 GB 的搬运。
+
+        而且量出来的代价远超搬运本身:每块新分配 8 MiB **同时**手里攥着
+        上百万个条目时,解析速度会从 9 µs/条掉到 53 µs/条(前 5 块 74ms、
+        后 5 块 440ms)。两个条件缺一个都不会发生 —— 只新分配不留条目稳定,
+        只留条目不新分配也稳定。tools/prof_mft_buffer.py 有四个变体的对照。
+
+        偏移和长度必须按扇区对齐。read() 会替调用方兜这件事(对齐到扇区再
+        切出中间那段),但那个切片就是要省掉的拷贝之一。MFT 那条路本来就是
+        按簇读的,而簇是扇区的整数倍,所以对齐是白得的 —— 不对齐直接报错,
+        而不是悄悄退回慢路子。
+        """
+        if length <= 0:
+            return 0
+        sector = self.boot.bytes_per_sector
+        if offset % sector or length % sector:
+            raise NtfsError(
+                f"read_into 要求扇区对齐:offset={offset} length={length} "
+                f"扇区={sector}。不对齐的读用 read()。"
+            )
+        if len(buf) < length:
+            raise NtfsError(f"缓冲区只有 {len(buf)} 字节,装不下 {length}")
+
+        self._seek(offset)
+        # from_buffer 拿的是 buf 内存的视图,不是副本 —— 这是不新分配的关键。
+        # 必须在函数里保住这个引用直到 ReadFile 返回。
+        view = (ctypes.c_char * len(buf)).from_buffer(buf)
+        read = wintypes.DWORD(0)
+        ok = self._k32.ReadFile(self._handle, view, length, ctypes.byref(read), None)
+        if not ok:
+            raise NtfsError(
+                f"读取 {length} 字节失败,Windows 错误 {ctypes.get_last_error()}"
+            )
+        self._pos += read.value
+        return read.value
+
     def read_clusters(self, lcn: int, count: int) -> bytes:
         bpc = self.boot.bytes_per_cluster
         return self.read(lcn * bpc, count * bpc)

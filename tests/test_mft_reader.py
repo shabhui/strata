@@ -35,6 +35,21 @@ class FakeVolume:
             return b""
         return self.image[offset : offset + length]
 
+    def read_into(self, offset: int, length: int, buf: bytearray) -> int:
+        """填调用方的缓冲区,返回字节数。语义照真实 Volume.read_into。
+
+        read_entries 走的是这条路(整趟复用一块缓冲区,见
+        test_mft_buffer_reuse.py)。这里**不清空** buf 里读到长度之后的部分 ——
+        真实实现也不清,调用方必须按返回值截断。清了的话「解析器有没有正确
+        按 got 截断」就测不出来了。
+        """
+        self.reads += 1
+        if offset >= len(self.image):
+            return 0
+        chunk = self.image[offset : offset + length]
+        buf[: len(chunk)] = chunk
+        return len(chunk)
+
     def read_clusters(self, lcn: int, count: int) -> bytes:
         return self.read(lcn * BYTES_PER_CLUSTER, count * BYTES_PER_CLUSTER)
 

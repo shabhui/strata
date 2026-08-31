@@ -228,6 +228,17 @@ class MftReader:
         record_index = 0
         chunk_bytes = CHUNK_RECORDS * rec_size
 
+        # 整趟就这一块。原来每块 `bytearray(raw)` 新分配 8 MiB,而这个循环
+        # 同时在往 entries 里攒上百万个条目 —— 这两件事同时成立时解析速度会
+        # 从 9 µs/条掉到 53 µs/条(前 5 块 74ms、后 5 块 440ms,越跑越慢)。
+        # 复用之后 161 万条从 72.6 秒降到 15.5 秒。
+        #
+        # 单独任何一个条件都不会触发:只新分配不留条目稳定在 68→74ms,
+        # 只留条目不新分配稳定在 75→76ms。四个变体的对照在
+        # tools/prof_mft_buffer.py,排掉掉频/换页/GC 的过程在
+        # tests/test_mft_buffer_reuse.py 的开头。
+        scratch = bytearray(chunk_bytes)
+
         for run in runs:
             if run.sparse or run.lcn is None:
                 # 稀疏段不含记录,但要推进记录号
@@ -241,7 +252,7 @@ class MftReader:
             while consumed < run_bytes:
                 want = min(chunk_bytes, run_bytes - consumed)
                 try:
-                    raw = self.vol.read(base_offset + consumed, want)
+                    got = self.vol.read_into(base_offset + consumed, want, scratch)
                 except NtfsError:
                     # 坏块:跳过这一批,继续往下
                     self.stats.parse_failures += 1
@@ -249,13 +260,15 @@ class MftReader:
                     consumed += want
                     continue
 
-                if not raw:
+                if not got:
                     break
-                buf = bytearray(raw)
-                count = len(buf) // rec_size
+                # 只解这次真读到的部分。缓冲区是复用的,got 之后是上一块的
+                # 残留 —— 最后一块几乎必然读不满,照 len(scratch) 解会把残留
+                # 当记录,解出一堆重复记录号。
+                count = got // rec_size
 
                 for i in range(count):
-                    entry, ext = self._parse_record(buf, i * rec_size, record_index + i)
+                    entry, ext = self._parse_record(scratch, i * rec_size, record_index + i)
                     if entry is not None:
                         entries.append(entry)
                     elif ext is not None:
@@ -267,12 +280,12 @@ class MftReader:
                             pending[base] = (prev[0] + a, prev[1] + l)
 
                 record_index += count
-                consumed += len(buf)
+                consumed += got
 
                 if progress is not None:
                     progress(record_index)
 
-                if len(buf) < want:
+                if got < want:
                     break
 
         self._apply_pending(entries, pending)

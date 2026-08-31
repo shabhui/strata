@@ -84,10 +84,17 @@ def bench(drive: str) -> None:
         f"孤立 {pstats.orphaned:,}  成环 {pstats.cycles:,}"
     )
 
-    scanned = st.bytes_total
+    # 口径要和真实扫描一致:snapshot._mft_to_scan_entries 不计文件形态的元文件
+    # (记录号 < 16)。不过滤的话这里永远报「差异偏大」—— 因为 $BadClus:$Bad 是
+    # 稀疏流,allocated_size 按定义等于整卷容量,一条就把总数顶上去一整卷。
+    # 实测本机 C: 不过滤是 397.19 GiB(系统已用 169.63 GiB,+134%),过滤后才对得上。
+    # 一条永远会响的警告和永远通过的检查一样没用,而且它会把人往错的方向带。
+    scanned = sum(e.bytes for e in entries if not e.is_dir and not e.is_metafile)
+    meta = st.bytes_total - scanned
     delta = scanned - used
     pct = (delta / used * 100) if used else 0
     print(f"\n合计       MFT 累计 {gib(scanned)}   系统已用 {gib(used)}")
+    print(f"           (另有元文件 {gib(meta)} 未计入,其中 $BadClus:$Bad 占一整卷)")
     print(f"差异       {gib(delta)}  ({pct:+.2f}%)")
     if abs(pct) < 3:
         print("           ✓ 在预期范围内(差异来自 MFT 自身、$LogFile、快照等)")
