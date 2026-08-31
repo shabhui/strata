@@ -176,15 +176,29 @@ class MetafileWarningTest(unittest.TestCase):
 
 
 class PreferMftDefaultTest(unittest.TestCase):
-    """默认不走 MFT。
+    """默认走 MFT。
 
-    实测 MFT 在这份实现上比 scandir 慢 2.6 倍(C: 100.5s vs 38.1s,原因是
-    read_entries 单线程逐条纯 Python 解析,而 scandir 那条路有线程池)。
-    提权成功反而让扫描变慢,这个默认值得钉住,别哪天顺手翻回去。
+    曾经默认关掉,因为实测 MFT 比 scandir 慢 2.6 倍(C: 100.5s vs 38.1s)。
+    后来把那 100 秒逐段量了一遍,发现大头是 read_entries 每读一块就新分配
+    8 MiB 缓冲区、同时又攥着上百万个条目 —— 两件事同时成立才会退化,
+    解析从 9 µs/条掉到 53 µs/条。复用一块缓冲区,再把 SQLite 页缓存从
+    默认 2 MB 开到 64 MiB,同一台机器背靠背各跑一次完整扫描:
+
+        第一次   mft 平均 30.3s   scandir 平均 43.4s   MFT 快 1.43x
+        第二次   mft 平均 80.1s   scandir 平均 115.5s  MFT 快 1.44x
+
+    绝对值飘了 2~4 倍,比值稳在 1.43~1.44(tools/bench_paths_head2head.py)。
+
+    钉住这个默认值的理由和当初一样,只是方向反了:MFT 更快、而且硬链接
+    只算一次(文件数 839,033 vs 927,570),别哪天顺手翻回去。
+
+    另一条曾经的理由「MFT 把总量说成两倍多」已经不成立:元文件过滤修掉
+    之后,两条路的偏差一样大(都 +15.6~15.9%)。那是另一个待查的 bug,
+    留着 scandir 当默认值也躲不开,详见 config.py 里那段。
     """
 
-    def test_config_default_is_off(self):
-        self.assertIs(config.PREFER_MFT, False)
+    def test_config_default_is_on(self):
+        self.assertIs(config.PREFER_MFT, True)
 
     def test_none_means_read_from_config(self):
         """collect_entries 不传 prefer_mft 时要去问 config,不是自己写死 False。
