@@ -139,12 +139,21 @@ class JournalInfo:
 @dataclass(slots=True)
 class UsnEvent:
     usn: int
-    file_reference: int
-    parent_reference: int
+    file_reference: int          # 掩过的,只有 MFT 记录号
+    parent_reference: int        # 同上,拿来跟 mft.resolve_paths 的键对
     timestamp: float | None
     reason: int
     attributes: int
     name: str
+    # 原样的 64 位引用:高 16 位是序列号,低 48 位是记录号。
+    #
+    # 为什么两个都留:记录号那份是为了跟 MFT 侧对齐(resolve_paths 的键就是
+    # 不带序列号的记录号),而 OpenFileById 只认完整的 —— 实测掩掉序列号
+    # 一个都开不了,4/4 返回错误 87(tools/probe_openbyid.py)。
+    # 序列号是日志里本来就有的信息,掩掉就找不回来了,所以两份都带着,
+    # 用哪份由用的人决定。
+    file_reference_full: int = 0
+    parent_reference_full: int = 0
 
     @property
     def is_dir(self) -> bool:
@@ -295,6 +304,8 @@ def _parse_record(
         reason=reason,
         attributes=attributes,
         name=name,
+        file_reference_full=file_ref,
+        parent_reference_full=parent_ref,
     )
 
 

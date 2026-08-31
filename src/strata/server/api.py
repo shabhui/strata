@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from typing import Any, Callable
@@ -25,6 +26,10 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+# `C:` / `C:\` 开头。库里的路径不含盘符,进来的路径要把它掐掉。
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:\\?")
 
 
 def _drive_param(params: dict[str, list[str]], conn: sqlite3.Connection) -> str:
@@ -157,10 +162,22 @@ def get_timeline(conn: sqlite3.Connection, params: dict) -> dict:
     }
 
 
+def _rel_path_param(params: dict, name: str = "path") -> str:
+    """取一个盘内相对路径,归一化成库里的口径。
+
+    schema.sql:31 —— 反斜杠、不含盘符、根目录空串。前端曾经把 `C:\\Users\\`
+    这种带盘符带尾巴的路径发过来,这里只 strip('\\') 掐不掉盘符,
+    get_dir() 于是查不到,整层显示成空的。归一化放在参数入口而不是各个
+    查询里:进了这道门之后,底下所有代码都能假定路径是干净的。
+    """
+    raw = (params.get(name) or [""])[0].replace("/", "\\")
+    return _DRIVE_PREFIX.sub("", raw).strip("\\")
+
+
 def get_tree(conn: sqlite3.Connection, params: dict) -> dict:
     """某个目录的直接子项,给树图和逐层下钻用。"""
     drive = _drive_param(params, conn)
-    path = (params.get("path") or [""])[0].replace("/", "\\").strip("\\")
+    path = _rel_path_param(params)
     limit = _int_param(params, "limit", 200, lo=1, hi=2000)
 
     snapshot_id = _int_param(params, "snapshot", 0, lo=0, hi=1 << 40)
@@ -184,6 +201,10 @@ def get_tree(conn: sqlite3.Connection, params: dict) -> dict:
         "node": {
             "path": path,
             "bytes": node["bytes"] if node else None,
+            # 本目录直属文件的字节。没有它,前端就只能拿子目录之和当本层总量,
+            # 直属文件那部分在树图上是个洞 —— 盘根最明显:pagefile.sys 和
+            # hiberfil.sys 都直挂在根下,真机上加起来常有 20 GB。
+            "own_bytes": node["own_bytes"] if node else None,
             "files": node["files"] if node else None,
             "dirs": node["dirs"] if node else None,
             "newest_mtime": node["newest_mtime"] if node else None,
@@ -273,12 +294,42 @@ def get_changes(conn: sqlite3.Connection, params: dict) -> dict:
     kind = (params.get("kind") or ["delete"])[0].strip() or "delete"
 
     cutoff = time.time() - days * 86400
+    # 一个文件一行。USN 记的是操作不是文件:一次「建-写-关-删」留下 5 条记录,
+    # reason 位一路累加(0x100 → 0x102 → 0x103 → 0x80000103 → 0x80000200),
+    # 每条有各自的 USN,所以入库时的 ON CONFLICT(drive, usn) 挡不住 ——
+    # 它们不是重复行,是同一个文件的不同时刻。
+    #
+    # 不合并的后果很集中:排序按字节数,而同一个文件的几条记录字节数一样,
+    # 于是它们连着占榜首。实盘上第一名和第二名就是同一个 32.2 MB 的压缩包。
+    #
+    # 只能按路径合并,不能按文件名。实盘上 `Editor` 出现 786 次、`Assets` 465 次,
+    # 那是几百个不同目录里的同名文件 —— 按名字合并等于凭空说「它被删了 786 次」。
+    # 所以路径为空的行按 usn 各自成组,一行都不并。
+    #
+    # bytes 取 MAX 而不是随便挑一条:USN 日志不记大小,这个值是从历史快照反查的,
+    # 几条记录里可能只有一条补到了,挑错了就白丢。
+    #
+    # kind / is_dir / name 直接裸取:kind 被 WHERE 定死,path 是分组键,而 name
+    # 是路径的末段、is_dir 是同一个文件的属性 —— 组内本来就只有一个值。
+    #
+    # 排序里夹了一档「有没有路径」。没路径的那种行上什么都没有:没路径、没大小
+    # (大小是按路径去历史快照反查的,没路径必然反查不到)、右键也定位不了 ——
+    # 可它照样占一个名额。实盘上量到:库里有 405 条带路径的删除记录,界面一次放
+    # 200 行,其中 115 行给了这种空行,用户能用的只剩 85 行。
+    #
+    # 之所以会混进来,是因为实盘上只有 4 行反查到了大小,剩下全靠 timestamp 排,
+    # 有路径的和没路径的就交替着来。加这一档,limit 切掉的就是最没用的那些。
+    # 不删它们:「有个叫这名字的东西被删了」也是信息,删掉等于替用户断言没发生过。
     rows = conn.execute(
         """
-        SELECT usn, timestamp, kind, is_dir, name, path, bytes
+        SELECT MAX(usn) usn, MAX(timestamp) timestamp, kind, is_dir, name, path,
+               MAX(bytes) bytes, COUNT(*) n
           FROM usn_events
          WHERE drive = ? AND timestamp >= ? AND kind = ?
-         ORDER BY COALESCE(bytes, 0) DESC, timestamp DESC
+         GROUP BY path, CASE WHEN path IS NULL OR path = '' THEN usn ELSE 0 END
+         ORDER BY COALESCE(MAX(bytes), 0) DESC,
+                  (path IS NOT NULL AND path <> '') DESC,
+                  MAX(timestamp) DESC
          LIMIT ?
         """,
         (drive, cutoff, kind, limit),
@@ -296,6 +347,9 @@ def get_changes(conn: sqlite3.Connection, params: dict) -> dict:
                 "name": r["name"],
                 "path": r["path"],
                 "bytes": r["bytes"],
+                # 折叠掉了几条。>1 说明这文件在窗口里反复出现,界面标出来 ——
+                # 「同一个临时文件被删了 115 次」本身是有用的信息,不能默默吞掉。
+                "count": r["n"],
             }
             for r in rows
         ],

@@ -31,9 +31,15 @@ def make_event(
     name: str,
     reason: int,
     parent: int = 5,
+    parent_full: int = 0,
     timestamp: float | None = None,
     attributes: int = 0x80,
 ) -> usn_mod.UsnEvent:
+    """parent 是掩过序列号的记录号(跟 MFT 侧对),parent_full 是原样 64 位。
+
+    parent_full 默认 0 —— 0 不是有效引用,反查会直接短路不发系统调用。
+    这个默认让原有的测试保持原样:它们测的是游标、去重、分类,跟反查无关。
+    """
     return usn_mod.UsnEvent(
         usn=usn,
         file_reference=usn + 1000,
@@ -42,6 +48,7 @@ def make_event(
         reason=reason,
         attributes=attributes,
         name=name,
+        parent_reference_full=parent_full,
     )
 
 
@@ -529,8 +536,15 @@ class DailySummaryTest(ChangesFixture):
 
 class CoverageAndPruneTest(ChangesFixture):
     def test_coverage_empty(self) -> None:
+        """一条事件都没有。available/reason 也得在,而且都是 None。
+
+        None 是「不知道」:这个盘没扫过,既没读成也没读失败。默认成 False 会让
+        一个没扫过的盘在界面上显示成故障。整个字典比,不比子集 —— 多出来的字段
+        应该是有意加的,让它撞一次比悄悄放过好。
+        """
         cov = changes.usn_coverage(self.conn, "C:")
-        self.assertEqual(cov, {"events": 0, "first_day": None, "last_day": None, "days": 0})
+        self.assertEqual(cov, {"events": 0, "first_day": None, "last_day": None,
+                               "days": 0, "available": None, "reason": None})
 
     def test_coverage_span(self) -> None:
         self.add_event_rows(
@@ -572,6 +586,158 @@ class CoverageAndPruneTest(ChangesFixture):
         changes.prune_usn_events(self.conn, "C:", keep_days=180)
         rows = list(self.conn.execute("SELECT drive FROM usn_events"))
         self.assertEqual([r["drive"] for r in rows], ["D:"])
+
+    def test_collect_usn_actually_calls_prune(self) -> None:
+        """上面两条测试直接调 prune,一直是绿的 —— 但生产从来没人调它。
+
+        这是「测过但没接上」:函数写了、测试写了、默认 keep_days=180 也写了,
+        而 grep 整个 src 只有定义、没有调用点,所以那个 180 天从来没生效过,
+        usn_events 表无上限地长。跟 dir_paths 是同一类事故,而且两处都是
+        测试给了假信心 —— 测试证明的是「函数能用」,不是「功能在跑」。
+        这条测的是后者:清理必须挂在正常扫描流程上,不然它等于不存在。
+        """
+        self.add_event_rows(
+            [
+                db.UsnRow(usn=1, timestamp=ts_days_ago(400), reason=0, kind="create",
+                          is_dir=False, name="ancient"),
+            ]
+        )
+        # 日志读不出来也不影响清理 —— 这里没有真日志,collect_usn 会走
+        # JournalUnavailable 那一支。清理照样得做:它跟能不能读日志无关。
+        changes.collect_usn(self.conn, "C:")
+        names = [r["name"] for r in self.conn.execute("SELECT name FROM usn_events")]
+        self.assertNotIn("ancient", names, "collect_usn 没有清理过期事件")
+
+
+class ResolverWiredIntoCollectTest(ChangesFixture):
+    """反查有没有真的接在采集流程上。
+
+    test_usn_path_resolve.py 测的是 DirPathResolver 本身能用,这里测的是
+    它在 collect_usn 里被用上了 —— 两件事,而且这个项目里后者栽过两次
+    (dir_paths 有字段没接、prune_usn_events 有函数没人调)。
+    单元测试给的是「零件合格」的信心,装没装上得单独证。
+    """
+
+    def fake_opener(self, table):
+        def opener(ref: int) -> str | None:
+            return table.get(ref)
+
+        return opener
+
+    def test_resolver_fills_what_dir_paths_cannot(self) -> None:
+        """dir_paths 认不出的父目录,反查得接上。
+
+        这是这条改动的正题:scandir 那条路给不出 dir_paths(取编号太贵),
+        所以日常扫描下第一条路是空的,全靠反查。
+        """
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(
+                usn=10, name="big.iso", reason=usn_mod.USN_REASON_FILE_DELETE,
+                parent=7, parent_full=0x0002_0000_0000_0007,
+            )
+        ]
+        stats = changes.collect_usn(
+            self.conn,
+            "C:",
+            dir_paths=None,           # scandir 扫的,没有这张表
+            opener=self.fake_opener({0x0002_0000_0000_0007: r"\\?\C:\Games\Steam"}),
+        )
+
+        row = self.conn.execute("SELECT path FROM usn_events").fetchone()
+        self.assertEqual(row["path"], r"Games\Steam\big.iso")
+        self.assertEqual(stats.resolved_paths, 1)
+        self.assertEqual(stats.lookups_ok, 1)
+
+    def test_dir_paths_wins_and_skips_the_syscall(self) -> None:
+        """能查字典就别发系统调用 —— 顺序反了就是拿 91 微秒换免费答案。"""
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(
+                usn=10, name="a.iso", reason=usn_mod.USN_REASON_FILE_DELETE,
+                parent=7, parent_full=0x0002_0000_0000_0007,
+            )
+        ]
+        called: list[int] = []
+
+        def counting_opener(ref: int) -> str | None:
+            called.append(ref)
+            return r"\\?\C:\WRONG"
+
+        stats = changes.collect_usn(
+            self.conn, "C:", dir_paths={7: r"Games\Steam"}, opener=counting_opener
+        )
+
+        row = self.conn.execute("SELECT path FROM usn_events").fetchone()
+        self.assertEqual(row["path"], r"Games\Steam\a.iso")
+        self.assertEqual(called, [], "dir_paths 已经有答案了,不该再问系统")
+        self.assertEqual(stats.lookups_ok, 0)
+
+    def test_unresolvable_parent_leaves_path_null(self) -> None:
+        """两条路都还不回来就留空。事件照存 —— 少个路径比少条记录好。"""
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(
+                usn=10, name="ghost.iso", reason=usn_mod.USN_REASON_FILE_DELETE,
+                parent=7, parent_full=0x0002_0000_0000_0007,
+            )
+        ]
+        stats = changes.collect_usn(
+            self.conn, "C:", dir_paths=None, opener=self.fake_opener({})
+        )
+
+        row = self.conn.execute("SELECT name, path FROM usn_events").fetchone()
+        self.assertEqual(row["name"], "ghost.iso")
+        self.assertIsNone(row["path"])
+        self.assertEqual(stats.lookups_failed, 1)
+        self.assertEqual(stats.events_stored, 1)
+
+    def test_opener_none_degrades_quietly(self) -> None:
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(
+                usn=10, name="x", reason=usn_mod.USN_REASON_FILE_DELETE,
+                parent=7, parent_full=0x0002_0000_0000_0007,
+            )
+        ]
+        stats = changes.collect_usn(self.conn, "C:", dir_paths=None, opener=None)
+
+        self.assertEqual(stats.events_stored, 1)
+        self.assertEqual(stats.lookups_ok, 0)
+        self.assertIsNotNone(stats.resolver_reason)
+
+    def test_default_actually_builds_a_real_opener(self) -> None:
+        """默认值必须是「去开一个」,不能是 None。
+
+        这条是整组里最要紧的一条。前两次事故都长一个样:参数在、文档写了、
+        单元测试绿着,而生产上那个参数从来没拿到过真货 —— 因为默认值让
+        「没接上」和「接上了但这次没结果」在外面看起来一模一样。
+        所以这里不看签名的默认值写了什么,直接看它有没有真去构造。
+        """
+        self.patch_journal()
+        FakeJournal.events = [
+            make_event(usn=10, name="x", reason=usn_mod.USN_REASON_FILE_DELETE)
+        ]
+        built: list[str] = []
+        original = changes.fileid.FileIdOpener
+
+        class SpyOpener:
+            def __init__(self, drive: str) -> None:
+                built.append(drive)
+
+            def path_of(self, ref: int) -> str | None:
+                return None
+
+            def close(self) -> None:
+                pass
+
+        changes.fileid.FileIdOpener = SpyOpener
+        self.addCleanup(lambda: setattr(changes.fileid, "FileIdOpener", original))
+
+        # 注意:不传 opener
+        changes.collect_usn(self.conn, "C:", dir_paths=None)
+
+        self.assertEqual(built, ["C:"], "默认没有去开 opener,反查等于没接上")
 
 
 if __name__ == "__main__":

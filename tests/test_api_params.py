@@ -97,5 +97,47 @@ class IntParamTest(unittest.TestCase):
         )
 
 
+class RelPathParamTest(unittest.TestCase):
+    """路径必须归一化成库里的口径:反斜杠、不含盘符、根目录空串。
+
+    前端发过 `C:\\Users\\` 这种带盘符带尾巴的路径 —— 原来的 strip('\\')
+    掐不掉盘符,get_dir() 查不到,那一层显示成空的,而且不报错。
+    """
+
+    BACK = "\\"
+
+    def test_already_clean_is_unchanged(self) -> None:
+        for raw in ("", "Users", "Users" + self.BACK + "sbhui"):
+            with self.subTest(raw=raw):
+                self.assertEqual(api._rel_path_param(q(path=raw)), raw)
+
+    def test_strips_drive_prefix(self) -> None:
+        b = self.BACK
+        cases = {
+            "C:" + b + "Users": "Users",
+            "C:" + b + "Users" + b: "Users",
+            "C:" + b: "",
+            "c:" + b + "Users" + b + "sbhui": "Users" + b + "sbhui",
+            "D:" + b + "games": "games",
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(api._rel_path_param(q(path=raw)), want)
+
+    def test_forward_slashes_become_backslashes(self) -> None:
+        self.assertEqual(
+            api._rel_path_param(q(path="c:/Users/sbhui")),
+            "Users" + self.BACK + "sbhui",
+        )
+
+    def test_strips_leading_and_trailing_separators(self) -> None:
+        b = self.BACK
+        self.assertEqual(api._rel_path_param(q(path=b + "Users" + b)), "Users")
+
+    def test_missing_param_is_root(self) -> None:
+        self.assertEqual(api._rel_path_param({}), "")
+        self.assertEqual(api._rel_path_param(q(path="")), "")
+
+
 if __name__ == "__main__":
     unittest.main()
