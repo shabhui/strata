@@ -193,8 +193,9 @@ class PreferMftDefaultTest(unittest.TestCase):
     只算一次(文件数 839,033 vs 927,570),别哪天顺手翻回去。
 
     另一条曾经的理由「MFT 把总量说成两倍多」已经不成立:元文件过滤修掉
-    之后,两条路的偏差一样大(都 +15.6~15.9%)。那是另一个待查的 bug,
-    留着 scandir 当默认值也躲不开,详见 config.py 里那段。
+    之后,两条路的偏差一样大(都 +15.6~15.9%)。那个偏差后来查明是 Compact OS
+    的 WOF 压缩(见 tests/test_wof_compression.py),而且**只有 MFT 这条路
+    修得动** —— scandir 只拿得到逻辑大小。所以现在默认走 MFT 的理由又多一条。
     """
 
     def test_config_default_is_on(self):

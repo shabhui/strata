@@ -27,6 +27,14 @@ ROOT_RECORD = 5
 # 一次读多少条记录。1024 字节/条时约 8 MB 一批。
 CHUNK_RECORDS = 8192
 
+# Compact OS(WOF)压缩把真实数据搬进这条备用流,主数据流退化成重解析点,
+# 而且**故意不设 FILE_ATTRIBUTE_COMPRESSED 位** —— 为了对老程序透明。
+# 所以只能靠流名认。实测本机 kernel32.dll / notepad.exe / explorer.exe 全是
+# 这个形状,逻辑大小是真实占盘的 2.7~2.8 倍;整盘因此虚报约 27 GB(+15.9%)。
+# 名字按 UTF-16-LE 存,17 个字符。长度先挡一道,绝大多数备用流一比就出局。
+WOF_STREAM = "wofcompresseddata"
+WOF_STREAM_CHARS = len(WOF_STREAM)
+
 
 @dataclass(slots=True)
 class FileEntry:
@@ -44,6 +52,10 @@ class FileEntry:
     hard_links: int = 1
     is_metafile: bool = False
     has_data: bool = False
+    # 见到 WofCompressedData 这条流就置位。必须记在条目上而不是就地判断:
+    # 幻影流和真实流可能分在不同的 MFT 记录里,得等所有记录读完才能定论。
+    # 详见 _apply_pending 和 tests/test_wof_compression.py。
+    wof: bool = False
 
     @property
     def is_reparse(self) -> bool:
@@ -153,6 +165,7 @@ class MftReader:
         logical = 0
         named_alloc = 0
         has_data = False
+        wof = False
 
         for attr, attr_off in A.iter_attributes(buf, header, offset, self.record_size):
             code = attr.type_code
@@ -170,14 +183,35 @@ class MftReader:
                 if size.named:
                     # 备用数据流也占盘,单独累加
                     named_alloc += size.allocated
+                    # 长度先挡:名字不是 17 个字符的直接不用取出来比
+                    if attr.name_length == WOF_STREAM_CHARS:
+                        start = attr_off + attr.name_offset
+                        raw_name = bytes(buf[start : start + WOF_STREAM_CHARS * 2])
+                        if raw_name.decode("utf-16-le", "replace").lower() == WOF_STREAM:
+                            wof = True
                 else:
                     alloc = size.allocated
                     logical = size.real
 
         if header.is_extension:
             self.stats.extension_records += 1
+            # 未命名和备用流分开报,WOF 的判断留给 _apply_pending ——
+            # 幻影流和真实流可能落在不同记录里,这条记录看不到全貌。
+            #
+            # 条件里**故意不带** named_alloc。曾经加过,想的是「只有备用流的
+            # 扩展记录也该报,否则那些字节凭空消失」。加完实测总量反而从
+            # +15.9% 涨到 +19.5%(tools/verify_wof_fix.py):被放进来的最大一条是
+            # $UsnJrnl 的 $J 流,39.83 GiB(tools/probe_wof_shapes.py 排出来的)。
+            # 那是 USN 变更日志,一个环形缓冲 —— 旧区间早释放了,allocated_size
+            # 报的是整个逻辑区间,真实占用只有活动窗口那几十 MB。
+            #
+            # 所以这里维持原样。这不是「$J 该被丢掉」的理由,只是「按
+            # allocated_size 把它算进来更错」。真要算准得走运行列表只数非稀疏段,
+            # 那条还没在真盘上验过,没验过的规则不进代码。
             if has_data and (alloc or logical):
-                return None, (header.base_record_number, alloc + named_alloc, logical)
+                return None, (
+                    header.base_record_number, alloc, named_alloc, logical, wof
+                )
             return None, None
 
         if best_name is None:
@@ -185,7 +219,11 @@ class MftReader:
             return None, None
 
         is_dir = header.is_directory
-        total_alloc = 0 if is_dir else alloc + named_alloc
+        # WOF 压缩:未命名流的 allocated 报的是**逻辑大小**(而且带稀疏位,
+        # 跟「稀疏 = 分配得少」的直觉正好相反),真实字节全在备用流里。
+        # 所以只算备用流之和 —— 之和而不是只算 WofCompressedData,因为一个
+        # 文件可以既被 WOF 压着、又带 Zone.Identifier 那样真占盘的流。
+        total_alloc = 0 if is_dir else (named_alloc if wof else alloc + named_alloc)
         total_logical = 0 if is_dir else logical
 
         # 目录本身不占数据空间,索引开销忽略不计
@@ -202,6 +240,7 @@ class MftReader:
             hard_links=header.hard_link_count,
             is_metafile=record_number < FIRST_USER_RECORD,
             has_data=has_data,
+            wof=wof,
         )
 
         if is_dir:
@@ -272,12 +311,17 @@ class MftReader:
                     if entry is not None:
                         entries.append(entry)
                     elif ext is not None:
-                        base, a, l = ext
+                        base, unnamed, named, l, w = ext
                         prev = pending.get(base)
                         if prev is None:
-                            pending[base] = (a, l)
+                            pending[base] = (unnamed, named, l, w)
                         else:
-                            pending[base] = (prev[0] + a, prev[1] + l)
+                            pending[base] = (
+                                prev[0] + unnamed,
+                                prev[1] + named,
+                                prev[2] + l,
+                                prev[3] or w,
+                            )
 
                 record_index += count
                 consumed += got
@@ -292,27 +336,44 @@ class MftReader:
         self.stats.duration_ms = int((time.perf_counter() - t0) * 1000)
         return entries
 
-    def _apply_pending(self, entries: list[FileEntry], pending: dict[int, tuple[int, int]]) -> None:
+    def _apply_pending(
+        self,
+        entries: list[FileEntry],
+        pending: dict[int, tuple[int, int, int, bool]],
+    ) -> None:
         """把扩展记录里的大小合并到对应基记录。
 
         高度碎片化的大文件($DATA 被挤到扩展记录)靠这一步才拿到正确大小。
+
+        WOF 压缩的文件必须在这里定论,不能在单条记录里判:幻影的未命名流和
+        真实的 WofCompressedData 流可能分在不同记录上。实测 Sessions.xml 就是
+        这样 —— 基记录带真实流 17.85M,扩展记录带幻影流 137.88M。原来这里对
+        两者取 max(),于是幻影赢了,库里记的就是 137.88M(逻辑大小)。
+        所以 pending 存的是拆开的 (未命名, 备用流, 逻辑, 是否WOF),
+        等两边的 wof 标记合并之后再决定算哪个。
         """
         if not pending:
             return
         by_record = {e.record: e for e in entries}
-        for record, (alloc, logical) in pending.items():
+        for record, (unnamed, named, logical, wof) in pending.items():
             entry = by_record.get(record)
             if entry is None or entry.is_dir:
                 continue
+            if wof:
+                entry.wof = True
+            alloc = named if entry.wof else unnamed + named
             # 基记录已有大小时取较大值,避免重复累加同一条流
             if entry.bytes == 0:
                 entry.bytes = alloc
-                entry.logical_bytes = logical
                 self.stats.bytes_total += alloc
             elif alloc > entry.bytes:
                 self.stats.bytes_total += alloc - entry.bytes
                 entry.bytes = alloc
-                entry.logical_bytes = max(entry.logical_bytes, logical)
+            # 逻辑大小单独取,不跟着 alloc 的分支走 —— WOF 文件的 alloc 会
+            # 被判成 0(幻影不算),但那条幻影流的 real_size 恰恰是唯一能
+            # 拿到的真实逻辑大小,丢了界面上「文件多大」就成 0 了。
+            if logical > entry.logical_bytes:
+                entry.logical_bytes = logical
 
 
 def resolve_paths(

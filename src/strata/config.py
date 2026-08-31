@@ -189,17 +189,37 @@ SYSTEM_DIRS = frozenset(
 #    所以报比值不报绝对值 —— 单次绝对值在这台机器上不可复现。
 #    最快的一次 MFT 26.1 秒跑完整次扫描,比原来记录的 scandir 38.8 秒还快。
 #
-# 二、总量那条不再是 MFT 独有的毛病。元文件过滤修掉之后(见
-#    snapshot._mft_to_scan_entries),两条路的偏差**一样大**:
+# 二、总量那条不再是 MFT 独有的毛病,而且现在 MFT 反而是唯一修得动的那条。
+#    元文件过滤修掉之后,两条路的偏差**一样大**:
 #
 #      快照 #19 mft       196.7G  系统已用 169.7G  +15.9%
 #      快照 #9  scandir   196.9G  系统已用 170.4G  +15.6%
 #      快照 #3  scandir   169.5G  系统已用 166.4G   +1.9%   ← 更早的快照是准的
 #
-#    两条路都虚报约 27 GB,所以这已经不是「选哪条路」的问题了,是另一个
-#    待查的 bug(稀疏文件的嫌疑最大:MFT 取 allocated_size、scandir 取
-#    逻辑大小,而 hiberfil.sys 6.29 GiB、几个 VHDX 加起来 9 GiB 都可能是稀疏的)。
-#    留着 scandir 当默认值并不能躲开它。
+#    两条路都虚报约 27 GB,当时判断是「另一个待查的 bug」。查出来了:是
+#    Compact OS 的 WOF 压缩(见 ntfs/mft.py 的 WOF_STREAM 和
+#    tests/test_wof_compression.py)。真实数据搬进 WofCompressedData 备用流,
+#    主数据流退化成带稀疏位的幻影 —— 而它的 allocated_size 照**逻辑大小**报,
+#    跟「稀疏 = 分配得少」的直觉正好相反。而且 WOF **故意不设**
+#    FILE_ATTRIBUTE_COMPRESSED 位(为了对老程序透明),所以看属性位认不出来:
+#    kernel32.dll 只有 ARCHIVE 位,却压着 1.8 倍。
+#
+#    真盘上量的账(tools/probe_wof_shapes.py,C:,提权直读 MFT):
+#
+#      78,587 个 WOF 文件   按老规则 57.48G   只算备用流 18.95G   差 38.54G
+#      其中最大一类是幻余流与真实流同在基记录的 47,093 个,单这一类差 21.31G
+#
+#    为什么这条只能在 MFT 那边修:scandir 拿的是 st_size,逻辑大小,
+#    Windows 没有便宜的接口给出「这个文件占多少簇」。GetCompressedFileSizeW
+#    能给准数,但那是每个文件一次系统调用 —— C: 上 115 万个文件,不可行
+#    (tools/probe_overcount.py 里 400 个文件就要几秒)。所以修完之后两条路
+#    会不一样:mft 更接近真实占盘,scandir 仍然是逻辑大小之和。界面上本来
+#    就显示走的是哪条路,两次扫描方法不同时也有专门的提示文案。
+#
+#    还没解决的:$UsnJrnl 的 $J 流按 allocated_size 报 39.83 GiB,而 USN 日志
+#    是环形缓冲,真实占用只有活动窗口那几十 MB。现在它没被算进来 —— 靠的是
+#    _parse_record 里「只有备用流的扩展记录不报」那条老条件,算歪打正着。
+#    要真算准得走运行列表只数非稀疏段,那条规则还没在真盘上验过。
 #
 # 口径上 MFT 本来就更准:硬链接只算一次(实测文件数 839,033 vs scandir
 # 927,570,差的 88,537 个基本都是 WinSxS 的硬链接),而且算的是占盘大小
