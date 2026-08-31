@@ -105,6 +105,7 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(target), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA cache_size = -{config.SQLITE_CACHE_KIB}")
     _ensure_schema(conn)
     repair_timestamps(conn)      # 一次性,靠 meta 里的标记跳过。见函数说明。
     return conn

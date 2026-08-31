@@ -187,6 +187,26 @@ SYSTEM_DIRS = frozenset(
 # 没查清之前不能说 MFT 的总量可信了。
 PREFER_MFT = False
 
+# SQLite 页缓存,单位 KiB(传给 PRAGMA cache_size 时取负数 —— 负数以 KiB 计,
+# 正数是页数,页大小一变含义就变了)。
+#
+# 默认只有 2 MB,而 dirs 表是 WITHOUT ROWID、主键 (snapshot_id, path) 是文本,
+# 整行存在按路径排序的 B 树里,另有两个索引 —— 每行要插三棵 B 树。而
+# prune_tree 产出的路径是乱序的,每行落在 B 树随机位置,2 MB 装不下索引就
+# 反复换页。实测(tools/bench_dbwrite_order.py,64,795 行 = 真实快照 #9):
+#
+#     默认 2 MB      1.94s   30.0 µs/行
+#     64 MiB         0.53s    8.2 µs/行   快 3.66x
+#
+# 行数越多差距越大:381,272 行时默认配置掉到 94.7 µs/行。D: 盘 203,997 个目录,
+# 比 C: 的 64,795 多两倍,受益更明显。
+#
+# 也试过插入前按主键排序,反而更慢(3.19s):主键那棵树变成顺序追加了,但两个
+# 二级索引(bytes DESC、depth)的插入顺序还是乱的,而排序本身又要花时间。
+#
+# 64 MiB 是缓存上限不是常驻占用 —— SQLite 按需分页,小库根本用不到。
+SQLITE_CACHE_KIB = 64 * 1024
+
 # 归因深度:把每个文件的增长归到路径前 N 段。
 # 3 段能区分到 `Users\alice\AppData` 和 `Program Files\Steam\steamapps`,
 # 比只看顶层目录有用得多。
