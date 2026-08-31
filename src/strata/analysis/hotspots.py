@@ -116,7 +116,7 @@ def biggest_dirs(
             """
             SELECT path, bytes, files, newest_mtime
               FROM dirs
-             WHERE snapshot_id = ? AND depth <= ?
+             WHERE snapshot_id = ? AND depth BETWEEN 1 AND ?
              ORDER BY bytes DESC
              LIMIT ?
             """,
@@ -186,17 +186,30 @@ def recently_grown(
 
     用 newest_ctime 判断,所以这是「最近被写入过的大目录」,
     不是「最近增长了多少」—— 后者需要两个快照才能算。
+
+    区间**两头都有界**。原来只有下界,于是写在未来的目录永远满足条件,被
+    永久钉在榜首,把真正在长的目录挤下去。真机上出过这一行:
+
+        6.41 GB  写入=2030-09-16  -1477.6 天前  Program Files (x86)
+
+    单边的区间条件不是「少了道防护」,是条件本身不完整 —— 「最近」按定义
+    就是 [cutoff, 现在] 这一段,写成只有下界等于说「从那天起,一直到永远」。
+
+    上界带容差(config.newest_ceiling),不掐在 now 上:跨机器拷来的文件常带
+    对面的钟,超前几小时是正常产物,掐死了会把真的刚写过的目录整个抹掉。
     """
     now = time.time() if now is None else now
     cutoff = now - days * 86400
+    ceiling = config.newest_ceiling(now)
     rows = conn.execute(
         """
         SELECT path, bytes, newest_ctime
           FROM dirs
-         WHERE snapshot_id = ? AND newest_ctime >= ? AND bytes >= ?
+         WHERE snapshot_id = ? AND depth >= 1
+           AND newest_ctime BETWEEN ? AND ? AND bytes >= ?
          ORDER BY bytes DESC LIMIT ?
         """,
-        (snapshot_id, cutoff, min_bytes, limit * 4),
+        (snapshot_id, cutoff, ceiling, min_bytes, limit * 4),
     )
 
     picked: list[GrowthSpot] = []
@@ -210,7 +223,10 @@ def recently_grown(
                 path=path,
                 bytes=int(row["bytes"]),
                 newest=newest,
-                days_old=((now - newest) / 86400) if newest else None,
+                # 不让它是负数。上面的上界带了容差,所以钟稍微超前的目录
+                # 会算出一个小负值 —— 那不是「未来写入」,是拷贝带来的偏差,
+                # 报 0 天(刚写过)比报 -0.04 天诚实。
+                days_old=max(0.0, (now - newest) / 86400) if newest else None,
             )
         )
         if len(picked) >= limit:
@@ -233,8 +249,12 @@ def cleanup_candidates(
 
     for row in conn.execute(
         """
+        -- depth >= 1 排掉盘根那一行。这一处是第二道:classify_path("") 必然
+        -- 返回 None(规则是子串匹配,空串命中不了任何 needle),所以根在下面
+        -- 那一步本来就会被挡掉 —— 删掉这个守卫测试也是绿的,变异验证过。
+        -- 留着是因为另外四处都这么写,而且规则匹配方式以后可能会变。
         SELECT path, bytes, files, newest_mtime FROM dirs
-         WHERE snapshot_id = ? AND bytes >= ?
+         WHERE snapshot_id = ? AND depth >= 1 AND bytes >= ?
          ORDER BY bytes DESC
         """,
         (snapshot_id, min_bytes),

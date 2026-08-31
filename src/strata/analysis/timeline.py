@@ -163,7 +163,9 @@ def _dir_bytes_at(
     return {
         r["path"]: r["bytes"]
         for r in conn.execute(
-            "SELECT path, bytes FROM dirs WHERE snapshot_id = ? AND depth <= ?",
+            # depth 0 是盘根那一行,排掉 —— 它是整块盘,会稳定当上第一贡献者。
+            "SELECT path, bytes FROM dirs "
+            " WHERE snapshot_id = ? AND depth BETWEEN 1 AND ?",
             (snapshot_id, depth),
         )
     }

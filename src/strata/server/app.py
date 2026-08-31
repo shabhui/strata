@@ -37,6 +37,11 @@ _scan_state: dict = {
     "finished_at": None,
     "result": None,
     "error": None,
+    # 已经数到的条目数,扫描中每两万个更新一次。前端拿它显示「已数 82 万项」——
+    # 不做百分比:总数要等扫完才知道,拿上一次快照的数去估会在盘上东西变多时
+    # 卡在 99%,那比没有进度更糟。
+    "counted": 0,
+    "stage": None,          # "mft" 或 "scandir",走哪条路
 }
 _state_lock = threading.Lock()
 
@@ -59,10 +64,22 @@ def _run_scan(drive: str, *, with_usn: bool = True) -> None:
     conn = None
     try:
         _set_state(running=True, drive=drive, phase="正在扫描", started_at=time.time(),
-                   finished_at=None, result=None, error=None)
+                   finished_at=None, result=None, error=None, counted=0)
         # 每个线程一个连接:sqlite 的连接不能跨线程用
         conn = db.connect()
-        result = snapshot_mod.scan_drive(conn, drive)
+
+        # 阶段和条数都往 state 里写。整条进度管道本来就通(walk_drive 每两万个
+        # 条目回调一次,实测中位间隔 0.75 秒),但这里一直没传 progress= ——
+        # 于是 phase 在整次扫描里一动不动地写着「正在扫描」,一分多钟里界面上
+        # 唯一的动静是那个转圈动画。用户说的「扫描时间太久」有一半是这个:
+        # 不知道它在干什么,也不知道还要多久。
+        #
+        # 只更新 state,不做别的:这个回调在扫描线程里跑,每两万个条目一次,
+        # 任何重活都会直接拖慢扫描本身。
+        def on_progress(stage: str, n: int) -> None:
+            _set_state(phase="正在扫描", counted=n, stage=stage)
+
+        result = snapshot_mod.scan_drive(conn, drive, progress=on_progress)
 
         payload = {
             "drive": drive,
@@ -75,13 +92,27 @@ def _run_scan(drive: str, *, with_usn: bool = True) -> None:
             "fallback_reason": getattr(result, "fallback_reason", None),
         }
 
-        if with_usn and privileges.is_admin():
-            _set_state(phase="正在读取变更日志")
-            stats = changes_mod.collect_usn(
-                conn, drive, dir_paths=getattr(result, "dir_paths", None)
-            )
-            changes_mod.enrich_deleted_sizes(conn, drive)
-            payload["usn"] = stats.as_dict()
+        if with_usn:
+            if privileges.is_admin():
+                _set_state(phase="正在读取变更日志")
+                # 直接取属性,不用 getattr(..., None) 兜 —— 兜底值正是之前
+                # 那个 bug 的藏身处:ScanResult 上压根没有 dir_paths 这个字段,
+                # 于是这里恒等于 None,每条事件的路径都存成 NULL,
+                # 「消失了什么」面板只剩裸文件名,而代码看着一切正常。
+                # 字段没了就该在这里炸,别让它悄悄退化成不工作。
+                stats = changes_mod.collect_usn(conn, drive, dir_paths=result.dir_paths)
+                changes_mod.enrich_deleted_sizes(conn, drive)
+                payload["usn"] = stats.as_dict()
+            else:
+                # 跳过也要留痕。原来这里是静默 return —— 于是「没提权」和
+                # 「读了但日志是空的」在前端长得一模一样,面板一律藏掉,
+                # 用户既发现不了这个功能,也不知道差什么。实测就是这么
+                # 掉进坑里的:库里 0 条事件,而同一台机器直读日志有 8 万条该入库。
+                payload["usn"] = changes_mod.ChangeStats(
+                    drive=drive,
+                    available=False,
+                    reason="需要管理员权限才能读变更日志。以管理员身份重新启动就能看到删除记录。",
+                ).as_dict()
 
         _set_state(running=False, phase="完成", finished_at=time.time(), result=payload)
     except Exception as exc:                       # noqa: BLE001

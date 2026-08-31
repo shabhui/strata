@@ -76,7 +76,34 @@ def attribution_of(path: str, depth: int = config.ATTRIBUTION_DEPTH) -> str:
     return "\\".join(parts)
 
 
-def _newer(a: float | None, b: float | None) -> float | None:
+def _newer(a: float | None, b: float | None, ceiling: float) -> float | None:
+    """取较新的一个,顺手把不可信的滤掉。
+
+    过滤放在这里而不是各个调用点:这是两个字段(mtime/ctime)、两轮聚合
+    (文件→目录、目录→父目录)的唯一入口。聚合取最大值,所以一个坏值会
+    被放大到它的每一级祖先 —— 真机上那个 2030 年就是这么从一个文件爬到
+    `Program Files (x86)`(6.5 GB,必然出现在大目录表里)再爬到盘根的。
+
+    后果不是崩,是**静默显示错的数**:`recently_grown` 按
+    `newest_ctime >= cutoff` 筛,2030 永远满足,那个目录被永久钉在
+    「最近写入」榜首;算出的 days_old 是 -1477.6,负数直接进了 API;
+    前端 `ageText` 判 `d < 1` 就说「今天」。而同一个目录在大目录表里用
+    `newest_mtime` 显示 2026-08-30 —— 两个面板自相矛盾。
+
+    ceiling 是必传的,没有默认值。写成 `ceiling=None` 再在里面兜一个
+    `time.time()` 会更好调用,但这个项目已经栽过两次「默认值让没接上的参数
+    看起来在工作」(dir_paths 从来没接上、prune_usn_events 从来没被调用)。
+    必传的话,漏接就是 TypeError,当场炸。
+
+    返 None 而不是退一个凑合的数:None 在下游是「不知道」,列表显示未知、
+    时间范围筛不到它。留个假数字下游会当真。
+    """
+    a = config.safe_ts(a)
+    b = config.safe_ts(b)
+    if a is not None and a > ceiling:
+        a = None
+    if b is not None and b > ceiling:
+        b = None
     if a is None:
         return b
     if b is None:
@@ -84,13 +111,19 @@ def _newer(a: float | None, b: float | None) -> float | None:
     return a if a > b else b
 
 
-def build_tree(entries: list[ScanEntry]) -> tuple[dict[str, DirNode], int, int]:
+def build_tree(
+    entries: list[ScanEntry], *, now: float | None = None
+) -> tuple[dict[str, DirNode], int, int]:
     """汇总出目录树。返回 (路径 → 节点, 总字节, 文件数)。
 
     两步:先把每个文件计到直属目录,再按深度降序做一次自底向上累计。
     文件的父目录若没被显式列出(MFT 路径解析失败等)会补建,
     连同缺失的祖先一起 —— 否则这些字节会凭空消失。
+
+    now 只给测试用。上界在这儿算一次然后传下去,不在 _newer 里每次取 ——
+    一次全盘扫描要调它一百多万次,而这个界在一次扫描里本来就该是同一个。
     """
+    ceiling = config.newest_ceiling(now)
     nodes: dict[str, DirNode] = {"": DirNode(path="", depth=0)}
 
     def ensure(path: str) -> DirNode:
@@ -112,15 +145,15 @@ def build_tree(entries: list[ScanEntry]) -> tuple[dict[str, DirNode], int, int]:
         if e.is_dir:
             if e.path != "":
                 node = ensure(e.path)
-                node.newest_mtime = _newer(node.newest_mtime, e.modified)
-                node.newest_ctime = _newer(node.newest_ctime, e.created)
+                node.newest_mtime = _newer(node.newest_mtime, e.modified, ceiling)
+                node.newest_ctime = _newer(node.newest_ctime, e.created, ceiling)
             continue
 
         node = ensure(parent_of(e.path) or "")
         node.direct_bytes += e.bytes
         node.direct_files += 1
-        node.newest_mtime = _newer(node.newest_mtime, e.modified)
-        node.newest_ctime = _newer(node.newest_ctime, e.created)
+        node.newest_mtime = _newer(node.newest_mtime, e.modified, ceiling)
+        node.newest_ctime = _newer(node.newest_ctime, e.created, ceiling)
         total_bytes += e.bytes
         total_files += 1
 
@@ -138,8 +171,8 @@ def build_tree(entries: list[ScanEntry]) -> tuple[dict[str, DirNode], int, int]:
         parent.subtree_bytes += node.subtree_bytes
         parent.subtree_files += node.subtree_files
         parent.subtree_dirs += node.subtree_dirs + 1  # +1 是 node 自己
-        parent.newest_mtime = _newer(parent.newest_mtime, node.newest_mtime)
-        parent.newest_ctime = _newer(parent.newest_ctime, node.newest_ctime)
+        parent.newest_mtime = _newer(parent.newest_mtime, node.newest_mtime, ceiling)
+        parent.newest_ctime = _newer(parent.newest_ctime, node.newest_ctime, ceiling)
 
     return nodes, total_bytes, total_files
 
@@ -158,7 +191,30 @@ def prune_tree(
     """
     keep: dict[str, DirRow] = {}
     for node in nodes.values():
+        # 根节点那一行无条件写出来,不参与保留判断。
+        #
+        # 原来直接 continue,盘根就没有行。后果不是少一行装饰:盘根下的文件
+        # (C: 上就是 pagefile.sys 和 hiberfil.sys,一般是整块盘最大的两个)
+        # 字节记在根节点的 direct_bytes 上,而这一行不落库 —— 这些字节进了
+        # scanned_bytes,却在树里查无此人,总数和树永远差这么多。实测构造
+        # 14 GB 盘根文件,树里写出的行 own_bytes 合计是 0。
+        #
+        # 顺带修掉 /api/tree?path= 返回 node: null。
+        #
+        # 加了这一行,底下所有按 depth 取目录的查询都得排掉 depth 0,不然
+        # 「整块盘」会稳定霸占榜首 —— 见 diff.py / timeline.py / hotspots.py
+        # 里的 depth BETWEEN 1 AND ? 和 depth >= 1。
         if node.path == "":
+            keep[""] = DirRow(
+                path="",
+                depth=0,
+                bytes=node.subtree_bytes,
+                own_bytes=node.direct_bytes,
+                files=node.subtree_files,
+                dirs=node.subtree_dirs,
+                newest_mtime=node.newest_mtime,
+                newest_ctime=node.newest_ctime,
+            )
             continue
         if node.subtree_bytes >= min_bytes or node.depth <= max_depth:
             keep[node.path] = DirRow(
@@ -175,13 +231,17 @@ def prune_tree(
     # 被裁掉的目录归给最近的保留祖先。
     # 只累加 direct_bytes:每个被裁节点各报自己的直属字节,
     # 合起来正好是这片被裁子树的总量,不会重复。
+    # 根现在也在 keep 里,所以不再需要把它排除在外 —— 顶层目录被裁掉时
+    # 正好折叠到根这一行上。三个判断都得跟着改:`""` 是 falsy,写成
+    # `if ancestor` 的话被裁掉的顶层目录会折叠到「没有地方」,folded_bytes
+    # 无声丢失。
     for node in nodes.values():
-        if node.path == "" or node.path in keep:
+        if node.path in keep:
             continue
         ancestor = parent_of(node.path)
-        while ancestor is not None and ancestor != "" and ancestor not in keep:
+        while ancestor is not None and ancestor not in keep:
             ancestor = parent_of(ancestor)
-        if ancestor and ancestor in keep:
+        if ancestor is not None and ancestor in keep:
             row = keep[ancestor]
             row.folded_children += 1
             row.folded_bytes += node.direct_bytes

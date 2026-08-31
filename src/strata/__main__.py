@@ -77,8 +77,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
                         print(f"  注意:{reason}")
 
                 if privileges.is_admin():
+                    # 同 server/app.py:不用 getattr 兜底,见那边的说明。
                     stats = changes_mod.collect_usn(
-                        conn, drive, dir_paths=getattr(result, "dir_paths", None)
+                        conn, drive, dir_paths=result.dir_paths
                     )
                     filled = changes_mod.enrich_deleted_sizes(conn, drive)
                     if not args.quiet:

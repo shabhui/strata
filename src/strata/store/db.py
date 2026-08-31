@@ -106,6 +106,7 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     _ensure_schema(conn)
+    repair_timestamps(conn)      # 一次性,靠 meta 里的标记跳过。见函数说明。
     return conn
 
 
@@ -116,6 +117,95 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (SCHEMA_VERSION,),
     )
+
+
+# 洗过坏时间戳的标记。见 repair_timestamps()。
+TS_REPAIR_KEY = "ts_repair_v1"
+
+
+def repair_timestamps(conn: sqlite3.Connection, *, force: bool = False) -> int:
+    """把已经入库的、不可信的时间戳洗成 NULL。返回洗掉几个。
+
+    ## 为什么需要它
+
+    `scan/tree.py` 的 `_newer` 挡住的是以后扫出来的。库里已经躺着的洗不到 ——
+    本机上是三个快照:
+
+        快照2 / 快照3 / 快照9   Program Files (x86)\\...\\Internet Download Manager
+        快照9  211402.3 MB  2030-09-16  (根)    ← 快照 9 是 C: 当前最新那个
+
+    一个 31.8 MB 目录里的文件,把 211 GB 的盘根染成了 2030 年。MAX 聚合会
+    把一个坏值放大到它的每一级祖先。快照要在库里留 120 天,不洗就得等用户
+    重扫一遍 C: 才能看到对的数。
+
+    ## 上界用每个快照自己的 taken_at
+
+    扫描记的是「那一刻硬盘长什么样」,所以任何文件的写入时间都不可能晚于
+    这次扫描本身。这比拿「现在」当界更紧也更对:一个 2026 年的坏值放在
+    2026 年的快照里该洗掉,而拿今天当界就会放过它。
+
+    容差和写入侧共用 `config.newest_ceiling`,两边同一个界 —— 不然洗完再扫
+    一次,同一个值一边留一边不留。
+
+    ## 洗成 NULL 而不是改成别的值
+
+    NULL 在下游是「不知道」:列表显示未知,`newest_ctime >= cutoff` 筛不到它。
+    退一个凑合的数下游会当真。
+
+    ## 只跑一次
+
+    写入侧已经堵住,之后不会再产生新的坏值,所以每次启动都扫 160k 行是
+    「永远只会通过的检查」。洗完在 meta 里记个标记,下次直接跳过。
+    force 只给测试和手工重跑用。
+    """
+    if not force:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (TS_REPAIR_KEY,)
+        ).fetchone()
+        if row is not None:
+            return 0
+
+    # (表, 列) —— 只洗聚合出来的和明细里的时间戳。
+    #
+    # usn_events.timestamp 不在这儿:它是日志事件自己的时间,不是聚合值,
+    # 不会被 MAX 放大;本机上量到 84,303 行全在范围内、没有一个在未来。
+    # 加一条永远不会命中的 UPDATE,就是这个项目最反对的那种检查。
+    targets = (
+        ("dirs", "newest_mtime"),
+        ("dirs", "newest_ctime"),
+        ("files", "mtime"),
+        ("files", "ctime"),
+    )
+
+    fixed = 0
+    try:
+        for table, col in targets:
+            for snap_id, taken_at in conn.execute(
+                "SELECT id, taken_at FROM snapshots"
+            ).fetchall():
+                ceiling = config.newest_ceiling(float(taken_at))
+                cur = conn.execute(
+                    f"""UPDATE {table} SET {col} = NULL
+                         WHERE snapshot_id = ?
+                           AND {col} IS NOT NULL
+                           AND ({col} > ? OR {col} < ?)""",
+                    (snap_id, ceiling, config.TS_MIN),
+                )
+                fixed += cur.rowcount or 0
+    except sqlite3.Error:
+        # 洗不动就算了。历史是这个工具唯一不可再生的东西,为了修一个显示问题
+        # 而拦住启动是本末倒置 —— 大不了那几行继续显示错的日期。
+        return 0
+
+    try:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (TS_REPAIR_KEY, str(fixed)),
+        )
+    except sqlite3.Error:
+        pass
+    return fixed
 
 
 # ---- 写入 --------------------------------------------------------------------
@@ -276,6 +366,46 @@ def get_usn_cursor(conn: sqlite3.Connection, drive: str) -> tuple[int, int] | No
         "SELECT journal_id, next_usn FROM usn_cursor WHERE drive = ?", (drive,)
     ).fetchone()
     return (int(row["journal_id"]), int(row["next_usn"])) if row else None
+
+
+def set_usn_status(
+    conn: sqlite3.Connection, drive: str, *, available: bool, reason: str | None
+) -> None:
+    """记下这次读日志成没成。成了就把上次的失败原因清掉。
+
+    读成功时必须显式写 reason=NULL —— 不然上次的失败原因会一直挂着,界面上
+    就会对着一栏有数据的表说「读不了,因为没权限」。
+    """
+    conn.execute(
+        """
+        INSERT INTO usn_status (drive, available, reason, checked_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(drive) DO UPDATE
+            SET available = excluded.available,
+                reason = excluded.reason,
+                checked_at = excluded.checked_at
+        """,
+        (drive, 1 if available else 0, reason, time.time()),
+    )
+
+
+def get_usn_status(conn: sqlite3.Connection, drive: str) -> dict | None:
+    """上次读日志的结果。没扫过这个盘就返回 None。
+
+    None 和 available=False 是两回事:前者是「不知道」,后者是「试过,失败了」。
+    把没扫过的盘显示成故障是在编事实。
+    """
+    row = conn.execute(
+        "SELECT available, reason, checked_at FROM usn_status WHERE drive = ?",
+        (drive,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "available": bool(row["available"]),
+        "reason": row["reason"],
+        "checked_at": float(row["checked_at"]),
+    }
 
 
 # ---- 读取 --------------------------------------------------------------------

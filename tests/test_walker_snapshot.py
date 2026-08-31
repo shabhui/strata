@@ -90,6 +90,76 @@ class WalkerTest(unittest.TestCase):
         self.assertGreaterEqual(stats.duration_ms, 0)
 
 
+class WalkerWorkersTest(unittest.TestCase):
+    """多线程遍历必须和单线程给出同一份结果。
+
+    走多线程是为了快(实测整块 C: 从 32.0 秒到 23.2 秒,1.38 倍;
+    瓶颈是 I/O,os.scandir 会放开 GIL)。但快没有意义,如果数出来的东西不一样 ——
+    所以这里比的是两种模式的输出集合完全相等,而不是「多线程也能跑」。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.expected = make_tree(self.root)
+        # 再挖深一点,让活分得开:一层的树看不出并发问题
+        for i in range(6):
+            d = self.root / f"br{i}" / "mid" / "leaf"
+            d.mkdir(parents=True)
+            (d / f"f{i}.bin").write_bytes(b"\0" * (i + 1) * KB)
+            self.expected[f"br{i}\\mid\\leaf\\f{i}.bin"] = (i + 1) * KB
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _norm(self, entries):
+        return sorted((e.path, e.is_dir, e.bytes) for e in entries)
+
+    def test_same_entries_as_serial(self):
+        serial, s1 = walker.walk_drive(str(self.root), workers=1)
+        threaded, s2 = walker.walk_drive(str(self.root), workers=8)
+        self.assertEqual(self._norm(serial), self._norm(threaded))
+        self.assertEqual((s1.files, s1.dirs, s1.bytes_total),
+                         (s2.files, s2.dirs, s2.bytes_total))
+
+    def test_no_duplicates(self):
+        """一个目录被两个线程各走一遍,大小就会翻倍 —— 这是并发最容易出的错。"""
+        entries, _ = walker.walk_drive(str(self.root), workers=8)
+        paths = [e.path for e in entries]
+        dupes = {p for p in paths if paths.count(p) > 1}
+        self.assertEqual(dupes, set(), f"这些路径被数了多次:{sorted(dupes)[:5]}")
+
+    def test_all_files_found_under_concurrency(self):
+        entries, stats = walker.walk_drive(str(self.root), workers=8)
+        found = {e.path for e in entries if not e.is_dir}
+        self.assertEqual(found, set(self.expected))
+        self.assertEqual(stats.bytes_total, sum(self.expected.values()))
+
+    def test_worker_count_is_clamped(self):
+        """0 或负数不能让它一个目录都不走。"""
+        for w in (0, -1):
+            with self.subTest(workers=w):
+                entries, stats = walker.walk_drive(str(self.root), workers=w)
+                self.assertEqual(stats.files, len(self.expected))
+
+    def test_progress_is_reported_and_monotonic(self):
+        """进度必须只增不减 —— 多线程下如果各线程报自己的局部计数,就会来回跳。
+
+        界面上那一行数字往回退,比不显示更让人以为出错了。
+        """
+        seen: list[int] = []
+        walker.walk_drive(str(self.root), workers=8,
+                          progress=seen.append, progress_every=1)
+        self.assertTrue(seen, "一次回调都没有")
+        self.assertEqual(seen, sorted(seen), f"进度往回退了:{seen}")
+
+    def test_errors_counted_not_raised(self):
+        """并发下权限错误也得只计数、不炸整次扫描。"""
+        entries, stats = walker.walk_drive(str(self.root / "nope"), workers=8)
+        self.assertEqual(entries, [])
+        self.assertEqual(stats.errors, 1)
+
+
 class SnapshotTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -236,7 +306,9 @@ class CollectEntriesFallbackTest(unittest.TestCase):
         )
         self.assertEqual(method, "scandir")
         self.assertGreater(len(entries), 0)
-        self.assertEqual(reason, "调用方指定跳过 MFT")
+        self.assertEqual(
+            reason, "按配置跳过 MFT,直接用目录遍历(见 config.PREFER_MFT)"
+        )
         self.assertTrue(any("硬链接" in w for w in warnings))
 
 

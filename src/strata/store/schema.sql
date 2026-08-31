@@ -97,3 +97,23 @@ CREATE TABLE IF NOT EXISTS usn_cursor (
     next_usn   INTEGER NOT NULL,
     updated_at REAL    NOT NULL
 );
+
+-- 上次读日志成没成,没成是为什么。每个盘一行。
+--
+-- 为什么要存:「这个盘没删过东西」和「这个盘我没看成」在界面上长得一模一样,
+-- 都是一张空表。原因原来在 collect_usn 里被 except 捕住、打一行日志就扔了,
+-- 于是提了权但日志没开的机器上,面板整段藏掉 —— 用户看到的跟「什么都没删过」
+-- 一个样。NTFS 上 USN 日志是可以关的,不少机器默认就是关的。
+--
+-- 单独一张表而不是往 usn_cursor 上加列:这个项目没有迁移机制,_ensure_schema
+-- 每次连库都重跑一遍本文件,而 CREATE TABLE IF NOT EXISTS 对已存在的表直接跳过
+-- —— 加列在老库上永远不会生效,建新表会。
+--
+-- 游标那张表也不合适装这个:读失败的时候游标不该动(动了就等于承认读到了那儿),
+-- 而失败原因恰恰是那时候才有的。两件事的写入时机是相反的。
+CREATE TABLE IF NOT EXISTS usn_status (
+    drive      TEXT PRIMARY KEY,
+    available  INTEGER NOT NULL,      -- 1 读成了,0 没读成
+    reason     TEXT,                  -- 没读成的原因;读成了为 NULL
+    checked_at REAL    NOT NULL
+);

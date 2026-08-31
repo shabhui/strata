@@ -1104,6 +1104,68 @@ class HotspotsTest(AnalysisFixture):
         self.assertEqual([g.path for g in grown], ["Fresh"])
         self.assertAlmostEqual(grown[0].days_old, 2, delta=0.5)
 
+    def test_recently_grown_excludes_the_future(self) -> None:
+        """「最近写入」是个区间,得有上界。
+
+        原来只有下界(`newest_ctime >= cutoff`),于是写在未来的目录**永远**
+        满足条件,被钉在榜首,把真正在长的目录挤下去。真机上就是这样:
+
+            6.41 GB  写入=2030-09-16  -1477.6 天前  Program Files (x86)
+
+        源头是 Internet Download Manager 里一个文件写着 2030-09-16,MAX 聚合
+        把它放大到了每一级祖先。写入侧现在挡住了(见 tests/test_bad_timestamps.py),
+        库里的旧行也洗过了(tests/test_ts_repair.py),这一条管的是查询本身:
+        一个只有单边的区间条件,来一行坏数据就会露。
+        """
+        now = ts_at(0, hour=18)
+        sid = self.add_snapshot(
+            taken_at=now, scanned=900 * MB, dirs={"Fresh": 200 * MB},
+            newest_ctime=ts_at(-2),
+        )
+        db.insert_dirs(self.conn, sid, [db.DirRow(
+            path="Program Files (x86)", depth=1,
+            bytes=600 * MB, own_bytes=600 * MB, files=1, dirs=0,
+            newest_mtime=ts_at(-1),
+            newest_ctime=now + 1478 * 86400,     # 真机上就是超前 1478 天
+        )])
+        self.conn.commit()
+
+        grown = hotspots.recently_grown(self.conn, sid, days=14, min_bytes=MB, now=now)
+        self.assertEqual(
+            [g.path for g in grown], ["Fresh"],
+            "写在未来的目录不该进「最近写入」—— 它比榜上任何真实目录都大",
+        )
+
+    def test_recently_grown_never_reports_negative_age(self) -> None:
+        """days_old 不能是负数。真机上出过 -1477.6,直接进了 API 的 JSON。"""
+        now = ts_at(0, hour=18)
+        sid = self.add_snapshot(
+            taken_at=now, scanned=900 * MB, dirs={"Fresh": 200 * MB},
+            newest_ctime=ts_at(-2),
+        )
+        db.insert_dirs(self.conn, sid, [db.DirRow(
+            path="Future", depth=1, bytes=600 * MB, own_bytes=600 * MB,
+            files=1, dirs=0, newest_ctime=now + 1478 * 86400,
+        )])
+        self.conn.commit()
+        for g in hotspots.recently_grown(self.conn, sid, days=14, min_bytes=MB, now=now):
+            self.assertGreaterEqual(g.days_old, 0, f"{g.path} 的 days_old 是负的")
+
+    def test_recently_grown_keeps_mild_clock_skew(self) -> None:
+        """超前几小时的留着 —— 跨机器拷来的文件常带对面的钟,那是正常产物。
+
+        少了这一条,把上界收成「不许超过 now」也能全绿,而那样会把这些目录
+        整个从「最近写入」里抹掉 —— 它们恰恰是真的刚写过。
+        """
+        now = ts_at(0, hour=18)
+        sid = self.add_snapshot(
+            taken_at=now, scanned=500 * MB, dirs={"Copied": 200 * MB},
+            newest_ctime=now + 3600,
+        )
+        grown = hotspots.recently_grown(self.conn, sid, days=14, min_bytes=MB, now=now)
+        self.assertEqual([g.path for g in grown], ["Copied"])
+        self.assertGreaterEqual(grown[0].days_old, 0)
+
     def test_recently_grown_excludes_descendants(self) -> None:
         now = ts_at(0, hour=18)
         sid = self.add_snapshot(
@@ -1166,6 +1228,84 @@ class HotspotsTest(AnalysisFixture):
             ["today", "week", "month", "quarter", "year", "older"],
         )
         self.assertTrue(all(b["bytes"] == 0 for b in profile))
+
+
+class RootRowExcludedFromAnalysisTest(AnalysisFixture):
+    """盘根那一行不能作为一个目录参与任何排行。
+
+    prune_tree 现在会写出 depth 0 的盘根行(在那之前盘根下的文件字节在树里
+    查无此人)。代价是所有按 depth 取目录的查询都得排掉它 —— 它的 bytes 是
+    整块盘、newest_ctime 是全盘最大值,不排就是稳定霸榜第一名,而且那一行
+    对人没有任何信息量:「你的 C: 占了整个 C:」。
+
+    五处查询各一条。这些守卫单看是一个 `depth >= 1`,很容易在改别的东西时
+    顺手删掉,而删掉之后功能「还能跑」,只是每张榜第一名都变成整块盘。
+    """
+
+    def _snap(self, taken_at: float, *, root: int, sub: dict[str, int],
+              newest_ctime: float | None = None) -> int:
+        dirs = {"": root}
+        dirs.update(sub)
+        return self.add_snapshot(
+            taken_at=taken_at, scanned=root, dirs=dirs, newest_ctime=newest_ctime
+        )
+
+    def test_biggest_dirs_skips_the_root(self) -> None:
+        sid = self._snap(ts_at(-1), root=200 * 1024**3,
+                         sub={"Windows": 40 * 1024**3, "Users": 30 * 1024**3})
+        out = hotspots.biggest_dirs(self.conn, sid)
+        self.assertEqual([h.path for h in out], ["Windows", "Users"])
+
+    def test_recently_grown_skips_the_root(self) -> None:
+        """根的 newest_ctime 是全盘最大值,不排它就永远是第一条。"""
+        now = time.time()
+        sid = self._snap(now - 86400, root=200 * 1024**3,
+                         sub={"Users\\alice\\Downloads": 5 * 1024**3},
+                         newest_ctime=now - 3600)
+        out = hotspots.recently_grown(self.conn, sid, now=now)
+        self.assertEqual([g.path for g in out], ["Users\\alice\\Downloads"])
+
+    def test_cleanup_candidates_skips_the_root(self) -> None:
+        """说清这条钉住的是什么:是「清理清单里不会出现整块盘」这个结果,
+        不是那句 depth >= 1。
+
+        变异验证过 —— 把那个守卫删掉,这条测试照样绿。因为 classify_path("")
+        必然返回 None(任何规则的 needle 都不可能出现在空串里),根在规则那一步
+        就被挡掉了。想让这条测试真正盯住守卫,得让空路径命中某条清理规则,
+        而那是构造上不可能的。
+
+        守卫仍然留着:另外四处都是这个写法,它便宜,而且万一 classify_path
+        以后改了(比如按目录名而不是子串匹配),它是第二道。
+        """
+        sid = self._snap(ts_at(-1), root=200 * 1024**3,
+                         sub={"Windows\\Temp": 3 * 1024**3})
+        out = hotspots.cleanup_candidates(self.conn, sid)
+        self.assertEqual([h.path for h in out], ["Windows\\Temp"])
+        self.assertNotIn("", {h.path for h in out})
+
+    def test_diff_does_not_report_the_whole_drive_as_a_change(self) -> None:
+        """盘长了 10 GB,该说是哪个目录长的,不是「盘长了」。"""
+        before = self._snap(ts_at(-2), root=100 * 1024**3,
+                            sub={"Games": 10 * 1024**3})
+        after = self._snap(ts_at(-1), root=110 * 1024**3,
+                           sub={"Games": 20 * 1024**3})
+        d = diff.diff_snapshots(self.conn, before, after)
+        changed = {x.path for x in d.grew} | {x.path for x in d.shrank}
+        self.assertNotIn("", changed)
+        self.assertIn("Games", {x.path for x in d.grew})
+
+    def test_timeline_contributors_are_never_the_root(self) -> None:
+        """实测日的贡献者要指向具体目录,不能是整块盘。"""
+        self._snap(ts_at(-3), root=100 * 1024**3, sub={"Games": 10 * 1024**3})
+        self._snap(ts_at(-1), root=130 * 1024**3, sub={"Games": 40 * 1024**3})
+        changes = timeline.build_timeline(self.conn, "C:", days=10)
+        measured = [c for c in changes if c.contributors]
+        self.assertTrue(measured, "没有实测日,这条测试什么都没验证")
+        for day in measured:
+            self.assertNotIn(
+                "", {c.path for c in day.contributors},
+                f"{day.day} 把整块盘当成了贡献者",
+            )
 
 
 if __name__ == "__main__":

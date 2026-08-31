@@ -128,6 +128,31 @@ SYSTEM_DIRS = frozenset(
     }
 )
 
+# 默认走不走 MFT 直读。
+#
+# 提权成功之后第一次真跑通 MFT,实测结果和设计意图相反,所以默认关掉:
+#
+#   本机 C:(1,079,118 个条目)
+#     scandir 热缓存   38.1s   28,718 条/秒
+#     scandir 冷缓存  119.1s    9,027 条/秒
+#     mft            100.5s   10,743 条/秒   之后 USN 再 29.2s
+#
+#   慢的原因是 mft.read_entries() 是单线程循环,每条记录调一次纯 Python 的
+#   _parse_record;而 walker.py 的 scandir 那条路有线程池。瓶颈在 CPU 不在
+#   I/O,所以 MFT「顺序读元数据所以快」这个前提在这份实现上不成立。
+#
+# 口径上 MFT 本该更准(硬链接只算一次、算占盘大小而非逻辑大小),但实测
+# scanned_bytes 比系统报的已用量多出整整一卷:C: 397.1 GB vs 169.2 GB,
+# D: 1389.7 GB vs 637.8 GB,两个盘的差额分别是整卷的 1.041 和 1.030 倍。
+# 原因是 NTFS 元文件(记录号 < 16)全挂在盘根下,其中 $BadClus:$Bad 是一条
+# 稀疏流,allocated_size 按定义就等于整卷容量。这些字节进了总数,又因为
+# prune_tree() 不写根节点那一行,在树里查无此人 —— 于是总数和树永远差一卷。
+# 见 scan/snapshot.py 里 _mft_to_scan_entries() 的元文件过滤。
+#
+# 两件事叠起来:MFT 现在既慢 2.6 倍又把总量说成两倍多。留着它当默认值,
+# 等于让提权成功反过来把体验变差。想单独用 MFT 的照样可以传 prefer_mft=True。
+PREFER_MFT = False
+
 # 归因深度:把每个文件的增长归到路径前 N 段。
 # 3 段能区分到 `Users\alice\AppData` 和 `Program Files\Steam\steamapps`,
 # 比只看顶层目录有用得多。
@@ -165,12 +190,47 @@ DEMOTE_DIR_MAX_DEPTH = 3
 TS_MIN = 0.0                      # 1970-01-01
 TS_MAX = 4102444800.0             # 2100-01-01
 
+# 「最新写入时间」允许比现在晚多少。
+#
+# TS_MIN/TS_MAX 管的是**能不能表示**(localtime 会不会抛),这个管的是
+# **可不可信**。两件事,界不一样,混用会漏 —— 本机上就漏了:
+#
+#   Program Files (x86)\Internet Download Manager 里有个文件写着 2030-09-16。
+#   1915769744 这个值离 TS_MAX(2100)还差得远,范围检查一路放行,
+#   于是它被 MAX 聚合放大到每一级祖先,最后连**盘根**的 newest_ctime
+#   都是 2030 年。界面上 6.5 GB 的 `Program Files (x86)` 被永久钉在
+#   「最近写入」榜首,算出的 days_old 是 -1477.6(负数进了 API),
+#   前端见 d < 1 就显示「今天」。
+#
+# 为什么留两天的余量而不是「一秒都不许超过现在」:
+#   跨机器拷来的文件常带对面的钟(几分钟到几小时)、夏令时算错是 1 小时、
+#   时区当成 UTC 是 8 小时、NAS 时区配错最多 26 小时。这些是正常产物,
+#   掐死了会把真实的最新时间丢成「未知」。而那个坏值超前 1478 天 ——
+#   离容差还有三个数量级,不存在挡不住又误伤的中间地带。
+FUTURE_TOLERANCE = 2 * 86400
 
-def safe_day(ts: float | None) -> str | None:
-    """时间戳转 YYYY-MM-DD;超出可用范围或转换失败时返回 None。
 
-    宁可丢掉一个坏时间戳,也不能让它把整次扫描带崩 —— 这种文件在系统盘上
-    很常见(FILETIME 0、未来时间、坏值)。
+def newest_ceiling(now: float | None = None) -> float:
+    """聚合「最新写入时间」时的上界:现在 + 容差,且不超过可表示范围。"""
+    current = _time.time() if now is None else now
+    return min(TS_MAX, current + FUTURE_TOLERANCE)
+
+
+def safe_ts(ts: float | None) -> float | None:
+    """越界、NaN、非数字的时间戳一律当「不知道」,原样返回可信的值。
+
+    这是范围判断的唯一定义,safe_day 和 scan/tree.py 的聚合都走它 ——
+    两处各写一遍的话,改了一处就会出现「分桶丢掉了但聚合留着」这种
+    互相矛盾的状态,而那正是本机上量到的现象:
+
+        dirs.newest_ctime  7 行在未来(2030-09-16,源头是 IDM 写的一个文件)
+                           6 行是负值(算出来 1608 年,ProgramData\\Package Cache)
+
+    聚合取最大值,于是那一个文件把它每一级祖先都染成 2030 年 —— 包括盘根。
+    分桶那边早就在挡了,聚合这边没挡,同一个目录在两张表里显示两个日期。
+
+    NaN 要单独判(`value != value`):它跟任何数比较都是 False,靠
+    `< TS_MIN or > TS_MAX` 挡不住,而后面 `a > b` 那种比较会静默走错分支。
     """
     if ts is None:
         return None
@@ -179,6 +239,18 @@ def safe_day(ts: float | None) -> str | None:
     except (TypeError, ValueError):
         return None
     if value != value or value < TS_MIN or value > TS_MAX:   # NaN 也在这里挡掉
+        return None
+    return value
+
+
+def safe_day(ts: float | None) -> str | None:
+    """时间戳转 YYYY-MM-DD;超出可用范围或转换失败时返回 None。
+
+    宁可丢掉一个坏时间戳,也不能让它把整次扫描带崩 —— 这种文件在系统盘上
+    很常见(FILETIME 0、未来时间、坏值)。
+    """
+    value = safe_ts(ts)
+    if value is None:
         return None
     try:
         return _time.strftime("%Y-%m-%d", _time.localtime(value))

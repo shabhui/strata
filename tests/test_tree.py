@@ -178,8 +178,74 @@ class PruneTreeTest(unittest.TestCase):
         ]
         nodes, _, _ = build_tree(entries)
         rows = prune_tree(nodes, min_bytes=0, max_depth=10)
-        top3 = [r.path for r in rows[:3]]
+        # 根那一行是整块盘,必然排最前;这里盯的是它后面的顺序
+        self.assertEqual(rows[0].path, "")
+        top3 = [r.path for r in rows[1:4]]
         self.assertEqual(top3, ["b", "c", "a"])
+
+
+class RootRowTest(unittest.TestCase):
+    """盘根那一行必须落库。
+
+    原来 prune_tree 直接 `if node.path == "": continue`,盘根就没有行。
+    后果不是少一行装饰:盘根下的文件字节记在根节点的 direct_bytes 上,这一行
+    不写出去,这些字节就进了 scanned_bytes 而在树里查无此人 —— 总数和树永远
+    差这么多,而且差的正好是 C: 上最大的两个文件(pagefile.sys、hiberfil.sys)。
+
+    这条在两条采集路径上都成立:scandir 给盘根文件的 path 是裸文件名,
+    MFT 那边 resolve_paths 把根记录映射成空串,结果一样。
+    """
+
+    def test_root_row_exists(self):
+        nodes, _, _ = build_tree([ScanEntry("a\\x", is_dir=False, bytes=MB)])
+        rows = prune_tree(nodes, min_bytes=0, max_depth=10)
+        self.assertIn("", {r.path for r in rows})
+
+    def test_root_level_file_bytes_are_reachable(self):
+        """核心那条:总数里的每个字节都要能在某一行的 own_bytes 里找到。"""
+        entries = [
+            ScanEntry("Windows", is_dir=True),
+            ScanEntry("Windows\\a.dll", is_dir=False, bytes=1000),
+            ScanEntry("pagefile.sys", is_dir=False, bytes=8 * GB),
+            ScanEntry("hiberfil.sys", is_dir=False, bytes=6 * GB),
+        ]
+        nodes, scanned, _ = build_tree(entries)
+        rows = prune_tree(nodes, min_bytes=0, max_depth=10)
+        self.assertEqual(sum(r.own_bytes for r in rows), scanned)
+
+        root = next(r for r in rows if r.path == "")
+        self.assertEqual(root.own_bytes, 14 * GB)
+        self.assertEqual(root.bytes, scanned)
+        self.assertEqual(root.depth, 0)
+
+    def test_root_row_survives_aggressive_pruning(self):
+        """裁剪阈值再狠也不能把根裁掉 —— 它不参与保留判断。"""
+        entries = [ScanEntry("deep\\deeper\\x.bin", is_dir=False, bytes=1024)]
+        nodes, scanned, _ = build_tree(entries)
+        rows = prune_tree(nodes, min_bytes=100 * GB, max_depth=0)
+        self.assertEqual([r.path for r in rows], [""])
+        # 被裁掉的顶层目录要折叠到根上,不能凭空消失
+        root = rows[0]
+        self.assertEqual(root.bytes, scanned)
+        self.assertEqual(root.folded_bytes, 1024)
+        self.assertEqual(root.folded_children, 2)
+
+    def test_folded_bytes_never_vanish(self):
+        """把每一行的 own_bytes 和 folded_bytes 加起来,应当等于总数。
+
+        钉的是 prune_tree 第二个循环里那三个 `""` 判断。`""` 是 falsy,
+        写成 `if ancestor` 的话被裁掉的顶层目录会折叠到「没有地方」。
+        """
+        entries = [
+            ScanEntry("big\\x.bin", is_dir=False, bytes=500 * MB),
+            ScanEntry("tiny1\\a.txt", is_dir=False, bytes=1000),
+            ScanEntry("tiny2\\b.txt", is_dir=False, bytes=2000),
+            ScanEntry("root.bin", is_dir=False, bytes=3000),
+        ]
+        nodes, scanned, _ = build_tree(entries)
+        rows = prune_tree(nodes, min_bytes=4 * MB, max_depth=0)
+        accounted = sum(r.own_bytes + r.folded_bytes for r in rows)
+        self.assertEqual(accounted, scanned)
 
 
 class BucketsTest(unittest.TestCase):

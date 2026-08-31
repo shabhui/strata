@@ -82,7 +82,10 @@ def _dirs(conn: sqlite3.Connection, snapshot_id: int, max_depth: int) -> dict[st
     return {
         r["path"]: r["bytes"]
         for r in conn.execute(
-            "SELECT path, bytes FROM dirs WHERE snapshot_id = ? AND depth <= ?",
+            # depth 0 是盘根那一行(prune_tree 现在会写它),排掉 —— 不然
+            # 「整块盘」会作为一个目录参与增减对比,永远是变化最大的那一项。
+            "SELECT path, bytes FROM dirs "
+            " WHERE snapshot_id = ? AND depth BETWEEN 1 AND ?",
             (snapshot_id, max_depth),
         )
     }

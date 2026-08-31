@@ -33,6 +33,17 @@ class ScanResult:
     bucket_rows: int = 0
     warnings: list[str] = field(default_factory=list)
     fallback_reason: str | None = None
+    # {目录编号 → 相对路径},给 changes.collect_usn 还原删除文件的路径用。
+    #
+    # 这个字段以前不存在,而 server/app.py:99 和 __main__.py:81 两处都写着
+    # `getattr(result, "dir_paths", None)` —— 于是两条路拿到的都恒等于 None,
+    # 每条 USN 事件的 path 存成 NULL,enrich_deleted_sizes 又要求
+    # `path IS NOT NULL` 才填大小,「消失了什么」面板就只剩裸文件名。
+    # 库里 84,303 条事件全是 NULL,一条都没例外。
+    #
+    # 参数被文档写过、被 test_changes.py 拿 {7: "Games\\Steam"} 测过、
+    # 就是从来没接上真货。这和「只会通过的检查」是同一类事:看着有,实际没有。
+    dir_paths: dict[int, str] = field(default_factory=dict)
 
     def summary(self) -> str:
         gib = 2**30
@@ -63,20 +74,47 @@ def _reparse_warning(count: int) -> list[str]:
 
 def _mft_to_scan_entries(
     entries: list[mft.FileEntry],
+    *,
+    dir_paths: dict[int, str] | None = None,
 ) -> tuple[list[tree.ScanEntry], int, list[str]]:
     """MFT 条目 → ScanEntry,顺带还原文件路径。
 
     父目录解析不出来的条目会被丢掉并计数 —— 这些字节确实无法归属,
     与其编一个假路径,不如如实报告有多少没归到位。
+
+    dir_paths 是出参。这条路上它是白捡的:resolve_paths() 返回的就是
+    {记录号 → 目录路径},本来算完就扔。而 MFT 记录号和 USN 的
+    parent_reference 是同一个东西(usn.py:293 把序列号掩掉之后),
+    所以直接对得上,不用像 scandir 那条路那样另花系统调用去取编号。
     """
     paths, pstats = mft.resolve_paths(entries)
+    if dir_paths is not None:
+        dir_paths.update(paths)
     out: list[tree.ScanEntry] = []
     orphaned_bytes = 0
+    metafile_bytes = 0
     warnings: list[str] = []
 
     for e in entries:
+        # NTFS 元文件($MFT、$LogFile、$BadClus……记录号 < 16)不计入。
+        #
+        # 不是嫌它们没用,是其中 $BadClus:$Bad 会把整块盘的容量报成一个文件:
+        # 它是稀疏流,allocated_size 按定义就等于整卷容量。实测本机 C: 因此把
+        # 169 GB 的盘说成用了 397 GB,D: 把 638 GB 说成 1390 GB —— 两个盘多出来的
+        # 都正好是一整卷(1.041 和 1.030 倍,零头是 $MFT 自己)。
+        #
+        # 而且这些字节还看不见:元文件全挂在盘根下,prune_tree() 不写根节点
+        # 那一行,所以总数里有、树里查无此人,总数和树永远差一卷。
+        #
+        # 目录形态的元文件($Extend,记录号 11)留着 —— 它下面 $RmMetadata 之类
+        # 是真实占用,而且 resolve_paths() 已经在完整列表上跑完了,这里过滤不会
+        # 让它的子项失去父链。
+        if e.is_metafile and not e.is_dir:
+            metafile_bytes += e.bytes
+            continue
+
         if e.is_dir:
-            # 根目录自身不作为条目;元文件目录也跳过
+            # 根目录自身不作为条目
             if e.record == mft.ROOT_RECORD:
                 continue
             path = paths.get(e.record)
@@ -122,6 +160,13 @@ def _mft_to_scan_entries(
     )
     if orphaned_bytes:
         warnings.append(f"{orphaned_bytes / 2**30:.2f} GiB 无法归属到路径")
+    # 排掉的量要说出来,不然「为什么和资源管理器差这么多」没法回答。
+    # 这个数会很大(含一整卷的 $BadClus),说清它是什么,别让人以为是丢了数据。
+    if metafile_bytes:
+        warnings.append(
+            f"NTFS 元文件未计入(共 {metafile_bytes / 2**30:.2f} GiB,"
+            f"其中 $BadClus 是稀疏流,按定义等于整卷容量,不是真实占用)"
+        )
 
     return out, orphaned_bytes, warnings
 
@@ -163,11 +208,25 @@ def _post_scan_maintenance(conn: sqlite3.Connection) -> None:
 def collect_entries(
     drive: str,
     *,
-    prefer_mft: bool = True,
+    prefer_mft: bool | None = None,
     progress: ProgressFn | None = None,
+    dir_paths: dict[int, str] | None = None,
 ) -> tuple[list[tree.ScanEntry], str, list[str], str | None]:
-    """采集条目。返回 (条目, 方法, 警告, 退化原因)。"""
+    """采集条目。返回 (条目, 方法, 警告, 退化原因)。
+
+    prefer_mft 传 None 表示用 config.PREFER_MFT(那边写了为什么默认是关的)。
+    显式传 True/False 的照旧,测试和命令行都靠这个。
+
+    dir_paths 是出参,只有 MFT 那一支会填 —— 那边 resolve_paths() 本来就算出
+    {记录号 → 目录路径},算完扔掉,接上不花钱。scandir 那一支填不了
+    (取编号太贵,见那边的注释),USN 靠 changes._resolve_by_id 兜。
+
+    还是 4 元组:8 处调用和一处写死了 `return_value=(entries, "mft", [], None)`
+    的 mock 都按 4 个解包,加第 5 个返回值会连 mock 一起炸。
+    """
     warnings: list[str] = []
+    if prefer_mft is None:
+        prefer_mft = config.PREFER_MFT
 
     if prefer_mft:
         try:
@@ -178,7 +237,9 @@ def collect_entries(
                 else:
                     reader_progress = None
                 raw = reader.read_entries(progress=reader_progress)
-            entries, _orphan_bytes, warns = _mft_to_scan_entries(raw)
+            entries, _orphan_bytes, warns = _mft_to_scan_entries(
+                raw, dir_paths=dir_paths
+            )
             warnings.extend(warns)
             st = reader.stats
             if st.fixup_failures or st.parse_failures:
@@ -194,11 +255,14 @@ def collect_entries(
         except OSError as exc:
             reason = f"打开卷失败:{exc}"
     else:
-        reason = "调用方指定跳过 MFT"
+        reason = "按配置跳过 MFT,直接用目录遍历(见 config.PREFER_MFT)"
 
-    # 退回 scandir
+    # 退回 scandir。这条路填不了 dir_paths —— 遍历时逐个取目录编号太贵
+    # (整块 C: 上 8 线程实测 68s → 165s),USN 那边改成读完日志再拿父引用
+    # 反查,见 changes._resolve_by_id。
     raw_walk, wstats = walker.walk_drive(
-        drive, progress=(lambda n: progress("scandir", n)) if progress else None
+        drive,
+        progress=(lambda n: progress("scandir", n)) if progress else None,
     )
     if wstats.errors:
         warnings.append(f"{wstats.errors:,} 个目录/文件读取被拒(已跳过)")
@@ -211,18 +275,19 @@ def scan_drive(
     conn: sqlite3.Connection,
     drive: str,
     *,
-    prefer_mft: bool = True,
+    prefer_mft: bool | None = None,
     progress: ProgressFn | None = None,
     now: float | None = None,
 ) -> ScanResult:
-    """扫描一个盘并写入一个快照。"""
+    """扫描一个盘并写入一个快照。prefer_mft=None 时用 config.PREFER_MFT。"""
     started = time.perf_counter()
     taken_at = time.time() if now is None else now
     total_bytes, free_bytes = volume_space(drive)
     used_bytes = total_bytes - free_bytes
 
+    dir_paths: dict[int, str] = {}
     entries, method, warnings, fallback_reason = collect_entries(
-        drive, prefer_mft=prefer_mft, progress=progress
+        drive, prefer_mft=prefer_mft, progress=progress, dir_paths=dir_paths
     )
 
     nodes, scanned_bytes, file_count = tree.build_tree(entries)
@@ -289,6 +354,7 @@ def scan_drive(
         bucket_rows=len(bucket_rows),
         warnings=warnings,
         fallback_reason=fallback_reason,
+        dir_paths=dir_paths,
     )
 
 
@@ -358,4 +424,8 @@ def scan_directory(
         dir_rows=len(dir_rows),
         file_rows=len(file_rows),
         bucket_rows=len(bucket_rows),
+        # scan_directory 走 scandir,拿不到目录编号,所以这里恒空。
+        # 留着字段而不是省掉:字段不在的话 getattr 的默认值会恒生效,
+        # 而那正是之前那个 bug —— 「压根没这个东西」和「有但这次是空的」
+        # 在调用方眼里长得一样,后者是状态,前者是 bug。
     )
