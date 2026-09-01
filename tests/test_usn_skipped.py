@@ -1,8 +1,8 @@
 """不提权时,「消失了什么」不能悄悄消失。
 
 实测到的毛病:库里 usn_events 和 usn_cursor 都是 0 行,而同一台机器上
-直接读 USN 日志能读到 20 万条事件、其中 84,303 条该入库(tools/probe_usn.py
-量的)。整条 USN 管道本身是通的 —— 断点在门口:
+直接读 USN 日志能读到 20 万条事件、其中 84,303 条该入库(一次性脚本量的,
+没留仓库)。整条 USN 管道本身是通的 —— 断点在门口:
 
   _run_scan 里 `if with_usn and privileges.is_admin():`(app.py:96)
   不是管理员就整段跳过,不写 state、不写 payload、不写日志。

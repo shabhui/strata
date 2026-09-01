@@ -229,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
         刚发出去的那个 413/400/403。socketserver 在 close 之前是有 shutdown(SHUT_WR)
         的,FIN 确实发了,但紧接着的 close 照样补一个 RST,照样把响应打掉。
 
-        实测(tools/probe_rst.py,声明超限长度、真发 N 字节、看客户端拿不拿到 413):
+        实测(一次性脚本,没留仓库:声明超限长度、真发 N 字节、看客户端拿不拿到 413):
             body 0 B / 1 KB      20 次全中
             body 64 KB           1/20 拿不到,ConnectionAbortedError
             body 256 KB          6/20 拿不到

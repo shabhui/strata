@@ -149,7 +149,7 @@ class UsnEvent:
     #
     # 为什么两个都留:记录号那份是为了跟 MFT 侧对齐(resolve_paths 的键就是
     # 不带序列号的记录号),而 OpenFileById 只认完整的 —— 实测掩掉序列号
-    # 一个都开不了,4/4 返回错误 87(tools/probe_openbyid.py)。
+    # 一个都开不了,4/4 返回错误 87(真盘上用一次性脚本量的,脚本没留仓库)。
     # 序列号是日志里本来就有的信息,掩掉就找不回来了,所以两份都带着,
     # 用哪份由用的人决定。
     file_reference_full: int = 0

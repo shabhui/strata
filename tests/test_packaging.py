@@ -136,5 +136,98 @@ class DatasSourcesExistTest(unittest.TestCase):
                 )
 
 
+class ToolsIndexIsHonestTest(unittest.TestCase):
+    """tools/README.md 那份索引,和目录里的实际内容必须对得上。
+
+    和上面几条同一个主题:写下来的清单会漂移,而漂移不报错。这一条有具体来路
+    —— 源码注释里曾指名 5 个 tools 脚本(probe_openbyid、probe_usn、probe_rst、
+    probe_roothint、probe_bad_ts),`git log` 显示它们**从来没被提交过**。当时
+    是拿一次性脚本量完数就删了,注释留下了指向,读者照注释去 tools/ 找会一无所获。
+
+    这和 hiddenimports 里那条不存在的 strata.analysis.treemap 是同一个毛病:
+    引用看起来在提供证据,实际指向空气,而且没有任何东西会报错。
+    """
+
+    TOOLS = ROOT / "tools"
+
+    def _listed(self) -> set:
+        import re
+
+        doc = (self.TOOLS / "README.md").read_text(encoding="utf-8")
+        return set(re.findall(r"`([A-Za-z_0-9]+\.(?:py|bat|spec|manifest))`", doc))
+
+    def _on_disk(self) -> set:
+        return {
+            p.name
+            for p in self.TOOLS.glob("*")
+            if p.is_file() and p.name != "README.md"
+        }
+
+    def test_index_has_no_phantom_entries(self):
+        """索引里的每个文件名都得真在 tools/ 下。"""
+        phantom = sorted(self._listed() - self._on_disk())
+        self.assertEqual(
+            phantom, [],
+            f"tools/README.md 提到了这些文件,但 tools/ 下没有:{phantom}。"
+            f"指向空气的引用比没有引用更糟 —— 读者会去找。",
+        )
+
+    def test_every_tool_is_in_the_index(self):
+        """tools/ 下的每个文件都得在索引里 —— 新加脚本别忘了写一行。"""
+        missing = sorted(self._on_disk() - self._listed())
+        self.assertEqual(
+            missing, [],
+            f"这些文件在 tools/ 下,但 tools/README.md 没提:{missing}。"
+            f"索引漏一个,那个脚本就等于没人知道它是干什么的。",
+        )
+
+
+class NoDanglingToolReferencesTest(unittest.TestCase):
+    """源码、测试、文档里写 tools/xxx.py 的地方,那个文件必须真存在。
+
+    这一条抓的正是上面 docstring 里说的 5 处。变异验证:把任意一处注释改回
+    `tools/probe_usn.py`,这条立刻红。
+    """
+
+    PATTERN = r"tools/([A-Za-z_0-9]+\.(?:py|bat|spec|manifest))"
+
+    # 这个文件自己不扫:上面几段 docstring 为了讲清问题,引用了几个**故意不存在**
+    # 的脚本名当例子。扫自己会把说明文字当成真引用 —— 第一次跑就撞上了。
+    #
+    # docs/superpowers/ 也不扫:那是 .gitignore 里的本地计划文档,不进仓库,
+    # 里面记的是当时那几个一次性脚本,属于历史记录而不是给读者的指路牌。
+    SKIP = ("__pycache__", "superpowers")
+
+    def test_all_cited_tools_exist(self):
+        import re
+
+        on_disk = {p.name for p in (ROOT / "tools").glob("*") if p.is_file()}
+        searched = 0
+        dangling = []
+        for folder in ("src", "tests", "docs"):
+            for path in (ROOT / folder).rglob("*"):
+                if path.suffix not in (".py", ".md", ".js", ".sql"):
+                    continue
+                if any(part in self.SKIP for part in path.parts):
+                    continue
+                if path.resolve() == Path(__file__).resolve():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                searched += 1
+                for name in re.findall(self.PATTERN, text):
+                    if name not in on_disk:
+                        rel = path.relative_to(ROOT).as_posix()
+                        dangling.append(f"{rel} 引用了 tools/{name}")
+        self.assertGreater(searched, 50, "扫到的文件太少,路径是不是变了")
+        self.assertEqual(
+            dangling, [],
+            "这些地方引用的 tools 脚本不存在 —— 注释在指向空气:\n  "
+            + "\n  ".join(dangling),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
