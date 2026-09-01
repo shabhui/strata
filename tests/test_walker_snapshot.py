@@ -490,6 +490,145 @@ class MftReparseSameWordingTest(unittest.TestCase):
         self.assertFalse([w for w in warnings if "联接点" in w])
 
 
+class ReparseCountIncludesSkippedEntriesTest(unittest.TestCase):
+    """联接点计数的口径:数的是「见到几个」,**包括被主循环跳过的那些**。
+
+    这条口径以前一条测试都没有,而它不是显而易见的 —— 所以钉下来。
+    上面 MftReparseSameWordingTest 那几条只走了「联接点被正常输出」这一条路。
+
+    ---- 顺带记一次没做成的优化,免得下一个人再走一遍 ----
+
+    这个计数是**第二遍全表扫**(`sum(1 for e in entries if e.is_reparse)`),
+    112 万条走两遍,而主循环本来就在遍历同一个列表。看着是白捡的。
+    **量下来只值 0.011 秒**(tools/bench_reparse_pass.py,同进程交错三轮,
+    1.25x),占整次扫描 19.13 秒的 **0.1%**。所以没改。
+
+    (改之前估的是 0.15 秒,错了 14 倍。那个估值是拿 cProfile 下的 0.86 秒
+    除一个猜的 profiler 系数得来的 —— cProfile 对 property 调用的放大远超
+    那个系数。**profiler 的绝对值不能拿来倒推真实耗时**,只能看占比。)
+
+    净差额本来就小,因为 property 调用两边次数一样:老写法在第二遍调,合进去
+    是在主循环里调。省掉的只是 112 万次 genexpr 迭代。
+
+    而合进去之后,正确性从「一个表达式」变成「必须写在四处 continue 之前」——
+    文件形态的元文件、根目录、父链断的目录、父链断的文件。写在后面数字就变小,
+    不报错,只是警告里少几个,没人看得出来。为 0.1% 换一个靠语句位置维持的
+    不变量,不划算。和 attribution_of 那次是同一个判断
+    (见 tests/test_bucket_fast_path.py)。
+
+    下面这六条就是当时为那个改动写的。改动撤了,它们留着 —— 口径本来就该有
+    覆盖,而且真有人再去合的时候,这几条会当场咬住。实测:把计数放到四处
+    continue 之后,六条里红五条。
+    """
+
+    ROOT = 5                              # mft.ROOT_RECORD
+    DIR_LINK = A.FILE_ATTR_DIRECTORY | A.FILE_ATTR_REPARSE_POINT
+    FILE_LINK = A.FILE_ATTR_ARCHIVE | A.FILE_ATTR_REPARSE_POINT
+
+    def _root(self):
+        return mft.FileEntry(record=self.ROOT, parent=self.ROOT, name=".", is_dir=True)
+
+    def count_in(self, entries) -> int:
+        """从警告里把数字抠出来。没有那句话就是 0。"""
+        _out, _orphan, warnings = snapshot._mft_to_scan_entries(entries)
+        for w in warnings:
+            if "联接点" in w:
+                return int(w.split(" ", 1)[0].replace(",", ""))
+        return 0
+
+    def test_metafile_reparse_is_counted(self):
+        """记录号 < 16 的文件被排掉(是 $BadClus 那类),但它带的标志要算。"""
+        entries = [
+            self._root(),
+            mft.FileEntry(
+                record=9, parent=self.ROOT, name="$Secure", is_dir=False,
+                bytes=8192, attributes=self.FILE_LINK, is_metafile=True,
+            ),
+        ]
+        self.assertEqual(self.count_in(entries), 1)
+
+    def test_root_itself_counted_if_flagged(self):
+        """根目录不作为条目输出,但真带上标志也得数 —— 口径是「见到几个」。"""
+        entries = [
+            mft.FileEntry(
+                record=self.ROOT, parent=self.ROOT, name=".", is_dir=True,
+                attributes=self.DIR_LINK,
+            ),
+        ]
+        self.assertEqual(self.count_in(entries), 1)
+
+    def test_orphaned_directory_reparse_is_counted(self):
+        """父链断了的联接点目录 —— 路径解不出来,但它确实在盘上。"""
+        entries = [
+            self._root(),
+            mft.FileEntry(
+                record=300, parent=99999, name="lost_link", is_dir=True,
+                attributes=self.DIR_LINK,
+            ),
+        ]
+        self.assertEqual(self.count_in(entries), 1)
+
+    def test_orphaned_file_reparse_is_counted(self):
+        entries = [
+            self._root(),
+            mft.FileEntry(
+                record=301, parent=99999, name="lost.lnk", is_dir=False,
+                bytes=1024, attributes=self.FILE_LINK,
+            ),
+        ]
+        self.assertEqual(self.count_in(entries), 1)
+
+    def test_all_four_skip_paths_at_once(self):
+        """四条跳过的路各来一个,再加一个正常输出的 —— 一共五个。
+
+        这条是总账。上面四条各自只有一个,数漏一个和数漏全部在数字上分不开;
+        这里五个里如果只数到一个,说明计数被放在了所有 continue 的后面。
+        """
+        entries = [
+            self._root(),
+            mft.FileEntry(
+                record=9, parent=self.ROOT, name="$Secure", is_dir=False,
+                bytes=8192, attributes=self.FILE_LINK, is_metafile=True,
+            ),
+            mft.FileEntry(
+                record=300, parent=99999, name="lost_link", is_dir=True,
+                attributes=self.DIR_LINK,
+            ),
+            mft.FileEntry(
+                record=301, parent=99999, name="lost.lnk", is_dir=False,
+                bytes=1024, attributes=self.FILE_LINK,
+            ),
+            mft.FileEntry(
+                record=400, parent=self.ROOT, name="good_link", is_dir=True,
+                attributes=self.DIR_LINK,
+            ),
+        ]
+        # 根目录那条不带标志,所以是 4 个;换成带标志的根就是 5 个
+        self.assertEqual(self.count_in(entries), 4)
+        entries[0] = mft.FileEntry(
+            record=self.ROOT, parent=self.ROOT, name=".", is_dir=True,
+            attributes=self.DIR_LINK,
+        )
+        self.assertEqual(self.count_in(entries), 5)
+
+    def test_non_reparse_entries_never_counted(self):
+        """反过来也要钉:普通条目不能被算进去。
+
+        没这一条的话,把计数写成「每条都加一」也能让上面全绿。
+        """
+        entries = [
+            self._root(),
+            mft.FileEntry(record=100, parent=self.ROOT, name="a.bin",
+                          is_dir=False, bytes=4096),
+            mft.FileEntry(record=101, parent=self.ROOT, name="sub", is_dir=True),
+            mft.FileEntry(record=9, parent=self.ROOT, name="$Secure",
+                          is_dir=False, bytes=8192, is_metafile=True),
+            mft.FileEntry(record=302, parent=99999, name="orphan.bin",
+                          is_dir=False, bytes=512),
+        ]
+        self.assertEqual(self.count_in(entries), 0)
+
+
 class NoReparseNoLineTest(unittest.TestCase):
     """没有联接点的时候不能凭空多出一句话。
 
