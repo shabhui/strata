@@ -75,6 +75,10 @@ def _snapshot_payload(row: sqlite3.Row | None) -> dict | None:
         "duration_ms": row["duration_ms"],
         "complete": bool(row["complete"]),
         "note": row["note"],
+        # 明细精简过没有。note 里那个中文标记不该让前端去解析 —— 判断只在
+        # db.is_demoted() 一处,这里出一个布尔量。降级过的快照钻不下去,
+        # 树图得据此换一句话说,不能说「还没有数据,先扫一次」。
+        "demoted": db.is_demoted(row["note"]),
     }
 
 

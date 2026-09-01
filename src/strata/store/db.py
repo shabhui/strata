@@ -583,6 +583,24 @@ def prune_old_buckets(conn: sqlite3.Connection, drive: str, keep_snapshot_id: in
     )
 
 
+#: 降级过的快照在 note 里留的标记。
+#
+# 这个串曾经被抄在四处(这个文件三处 + analysis/diff.py 一处)。抄的代价不是
+# 难看,是漏改:少改一处,那一处就永远判 False,不报错、不抛异常，只是界面上
+# 少说一句话。所以定义和判断各只留一份,别再内联字面量。
+DEMOTED_MARK = "[已降级]"
+
+
+def is_demoted(note: str | None) -> bool:
+    """这条快照的明细是不是已经被精简过。
+
+    降级删掉的是 files 整张表和深处的小目录行(见 demote_snapshot),所以
+    降级过的快照钻不下去。界面需要据此换一句话说 —— 说成「还没有数据」会让
+    用户去再扫一次,而扫一次只会把它降得更狠。
+    """
+    return DEMOTED_MARK in (note or "")
+
+
 def demote_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> tuple[int, int]:
     """把旧快照降级成粗粒度,只留够画时间轴和做对比的行。
 
@@ -602,9 +620,9 @@ def demote_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> tuple[int, in
     files_gone = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     conn.execute(
-        "UPDATE snapshots SET note = COALESCE(note || ' ', '') || '[已降级]' "
-        "WHERE id = ? AND COALESCE(note, '') NOT LIKE '%[已降级]%'",
-        (snapshot_id,),
+        "UPDATE snapshots SET note = COALESCE(note || ' ', '') || ? "
+        "WHERE id = ? AND COALESCE(note, '') NOT LIKE ?",
+        (DEMOTED_MARK, snapshot_id, f"%{DEMOTED_MARK}%"),
     )
     return dirs_gone, files_gone
 
@@ -615,9 +633,9 @@ def demote_previous_snapshots(conn: sqlite3.Connection, drive: str, keep_snapsho
         conn.execute(
             """
             SELECT id FROM snapshots
-             WHERE drive = ? AND id <> ? AND COALESCE(note, '') NOT LIKE '%[已降级]%'
+             WHERE drive = ? AND id <> ? AND COALESCE(note, '') NOT LIKE ?
             """,
-            (drive, keep_snapshot_id),
+            (drive, keep_snapshot_id, f"%{DEMOTED_MARK}%"),
         )
     )
     for row in rows:

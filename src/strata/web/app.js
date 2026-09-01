@@ -455,6 +455,10 @@ function paintTreemap(ctx, W, H) {
     ctx.fillStyle = '#47646a';
     ctx.font = '13px "Segoe UI", "Microsoft YaHei UI", sans-serif';
     ctx.textAlign = 'center';
+    // 只有一句话可说,因为树图永远画最新快照(enterPath 不传 snapshot,
+    // 而 demote_previous_snapshots 从不降级最新的那个)。想给降级过的快照
+    // 换一句「明细已精简」得先有办法让树图指向旧快照 —— 见 api.py 里
+    // get_tree 那段。没有那个入口的话,那句话永远不会被显示。
     ctx.fillText(t('tm.empty'), W / 2, H / 2);
     ctx.textAlign = 'left';
     return;

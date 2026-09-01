@@ -155,9 +155,7 @@ def diff_snapshots(
     # 后端不知道人在看哪种语言,切语言时也不会重新请求,所以中文不能写在这儿。
     caveats: list[dict] = []
     demoted = [
-        row["id"]
-        for row in (before, after)
-        if "[已降级]" in (row["note"] or "")
+        row["id"] for row in (before, after) if db.is_demoted(row["note"])
     ]
     if demoted:
         # 深度和字节数从 config 取,别写死在文案里 —— 原来这两个数字是手写的
