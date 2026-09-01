@@ -1,6 +1,7 @@
 """_parse_record 每秒能解多少条 —— 这是 100 秒里最后一段没量过的。
 
-要回答的问题:C: 走 MFT 全程 100.5 秒(config.py:138)。逐段量下来:
+来路(**这笔账是 100.5 秒那会儿的**,现在整次扫描 23.4 秒 —— 留着是为了看清
+当初怎么把时间找出来的):C: 走 MFT 全程 100.5 秒(config.py:138)。逐段量下来:
 
     收集后那五遍            8.8s   prof_pipeline.py
     _mft_to_scan_entries   11.6s   prof_mft_convert.py(其中 resolve_paths 只 1.1s)
@@ -16,9 +17,23 @@ bench_mft_read.py 的开头假定解析只值 12.7 秒(按「127,109 条/秒」�
 
     python tools/bench_parse_record.py
 
-合成记录比真盘上的简单(3 个属性、名字短、没有 $ATTRIBUTE_LIST),所以量出来的
-速率是**上限** —— 真盘只会更慢。要是连上限都远低于 127,109 条/秒,那 79 秒
-就找到主人了。
+量**两种**记录构成,因为只量一种会看错:
+
+  三条全认识   $STANDARD_INFORMATION + $FILE_NAME + $DATA,全都在用。
+               这是一条记录能有的最便宜的样子,所以它是速率上限。
+  本机构成     照 prof_collect_stages.py 的实测比例:四分之一空闲,在用的里面
+               24.4% 是目录、目录还挂着三条解析器不认识的属性。
+
+只量前者会把「先看在用位」和「不认识的属性不建头」这两条近道的效果全抹掉 ——
+那种记录里没有空闲的、也没有不认识的属性,近道一次都用不上。改这两处那天
+量到的差别就是这么来的(同一份合成输入,src 用 git stash 换掉再跑一遍):
+
+                  改前            改后         提速
+    三条全认识    107,224 条/秒   113,702 条/秒  1.06x
+    本机构成      126,915 条/秒   146,343 条/秒  1.15x
+
+反直觉的一点:本机构成比「最便宜的记录」跑得**快**。因为四分之一的记录空闲,
+在在用位那一步就走开了 —— 改之前它们还要先还原一遍 USA 才被丢掉。
 """
 
 from __future__ import annotations
@@ -41,7 +56,30 @@ N_RECORDS = 1_610_000        # C: 的 MFT 记录数
 CHUNK_RECORDS = mft.CHUNK_RECORDS
 
 
-def make_record(record_number: int, name: str, *, is_dir: bool = False) -> bytearray:
+def filler_attr(type_code: int, value_len: int, attr_id: int) -> bytes:
+    """任意类型码的一条常驻属性,内容不重要,只为占住长度。
+
+    真盘上的目录还挂着 $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP,文件常有
+    $OBJECT_ID。解析器一个都不认,但**它们仍然要被走过**:得取出长度才能
+    找到下一条。所以「一条属性有多贵」得分成「认识的」和「不认识的」两种来量,
+    上面那个只有三条全认识的记录量不出后者。
+    """
+    length = 24 + value_len
+    length += (-length) % 8
+    buf = bytearray(length)
+    struct.pack_into("<IIBBHHH", buf, 0, type_code, length, 0, 0, 0, 0, attr_id)
+    struct.pack_into("<IH", buf, 16, value_len, 24)
+    return bytes(buf)
+
+
+def make_record(
+    record_number: int,
+    name: str,
+    *,
+    is_dir: bool = False,
+    extra: bytes = b"",
+    in_use: bool = True,
+) -> bytearray:
     """造一条能通过 fixup 校验、三个属性都解得出来的 MFT 记录。
 
     布局(和真盘一致):
@@ -107,11 +145,18 @@ def make_record(record_number: int, name: str, *, is_dir: bool = False) -> bytea
                          12345)          # initialized_size
         pos += da_len
 
+    # ---- 解析器不认的那几条(目录的索引属性之类)----
+    if extra:
+        buf[pos : pos + len(extra)] = extra
+        pos += len(extra)
+
     struct.pack_into("<I", buf, pos, A.ATTR_END)
     used = pos + 8
 
     # ---- 记录头 ----
-    flags = A.MFT_RECORD_IN_USE | (A.MFT_RECORD_IS_DIRECTORY if is_dir else 0)
+    flags = (A.MFT_RECORD_IN_USE if in_use else 0) | (
+        A.MFT_RECORD_IS_DIRECTORY if is_dir else 0
+    )
     struct.pack_into("<4sHHQHHHHIIQHHI", buf, 0,
                      A.MAGIC_FILE, usa_offset, usa_count, 0,
                      1,              # sequence
@@ -141,6 +186,42 @@ def build_chunk(n: int, start_record: int) -> bytearray:
     return chunk
 
 
+def build_chunk_mixed(n: int, start_record: int) -> bytearray:
+    """照本机 C: 的实际构成拼一块,不是照「最省事的合成记录」。
+
+    比例取自 tools/prof_collect_stages.py 那次提权跑的统计:
+
+        见到 1,611,542 条   在用 1,204,672 条   →  空闲 406,870 条(25.2%)
+        文件 824,439        目录 293,461       →  目录占在用的 24.4%
+
+    两处和上面那个 build_chunk 不同,而这两处正好是解析器能省下功夫的地方:
+
+      * 目录带 $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP —— 三条都不认识,
+        但都得走过去
+      * 四分之一的记录是空闲的 —— 在用位一看就该走开,不必还原 USA
+
+    所以 build_chunk 量的是「一条最便宜的记录」,这个量的是「本机的一条记录」。
+    两个都要:前者是上限,后者是实际。
+    """
+    # 长度照真盘上常见的量级取,不必精确 —— 要紧的是「有几条不认识的属性」
+    dir_extra = (
+        filler_attr(A.ATTR_INDEX_ROOT, 200, 3)
+        + filler_attr(A.ATTR_INDEX_ALLOCATION, 80, 4)
+        + filler_attr(0xB0, 32, 5)          # $BITMAP
+    )
+    chunk = bytearray()
+    for i in range(n):
+        rec = start_record + i
+        slot = i % 1000
+        if slot < 252:                       # 25.2% 空闲
+            chunk += make_record(rec, f"free{rec}.dat", in_use=False)
+        elif slot < 252 + 183:               # 在用里 24.4% 是目录
+            chunk += make_record(rec, f"dir{rec}", is_dir=True, extra=dir_extra)
+        else:
+            chunk += make_record(rec, f"file{rec}.dat")
+    return chunk
+
+
 class FakeVol:
     """MftReader 只在初始化时读引导扇区,给它一个假的就够。"""
 
@@ -155,6 +236,31 @@ class FakeVol:
 
     def read(self, offset: int, length: int) -> bytes:
         return b"\x00" * length
+
+
+def timed_pass(reader, template: bytearray, n_chunks: int) -> tuple[float, int, mft.MftStats]:
+    """把同一块解 n_chunks 遍,返回 (秒, 条数, 统计)。"""
+    reader.stats = mft.MftStats()
+    gc.collect()
+    total = 0
+    t = time.perf_counter()
+    for c in range(n_chunks):
+        # 每块要新的 bytearray:apply_fixups 就地改写,同一块解第二遍
+        # USN 校验就不过了(attributes.py 里已经把原值写回去了)
+        buf = bytearray(template)
+        base = 100_000 + c * CHUNK_RECORDS
+        for i in range(CHUNK_RECORDS):
+            entry, ext = reader._parse_record(buf, i * REC, base + i)
+            total += 1
+    return time.perf_counter() - t, total, reader.stats
+
+
+def report_pass(label: str, secs: float, total: int, st: mft.MftStats) -> float:
+    rate = total / secs
+    print(f"{label:<12} {secs:>7.2f}s  {total:,} 条  {rate:>9,.0f} 条/秒")
+    print(f"{'':<12} 在用 {st.records_in_use:,}   fixup 失败 {st.fixup_failures}   "
+          f"解析失败 {st.parse_failures}   无名字 {st.unnamed}")
+    return rate
 
 
 def main() -> int:
@@ -187,44 +293,33 @@ def main() -> int:
     template = build_chunk(CHUNK_RECORDS, 100_000)
     print(f"  造块本身 {time.perf_counter() - t:.1f}s(不算在下面)\n")
 
-    n_chunks = N_RECORDS // CHUNK_RECORDS
-    gc.collect()
-
-    reader.stats = mft.MftStats()
-    total = 0
     t = time.perf_counter()
-    for c in range(n_chunks):
-        # 每块要新的 bytearray:apply_fixups 就地改写,同一块解第二遍
-        # USN 校验就不过了(attributes.py:190 已经把原值写回去了)
-        buf = bytearray(template)
-        base = 100_000 + c * CHUNK_RECORDS
-        for i in range(CHUNK_RECORDS):
-            entry, ext = reader._parse_record(buf, i * REC, base + i)
-            total += 1
-    secs = time.perf_counter() - t
+    mixed = build_chunk_mixed(CHUNK_RECORDS, 100_000)
+    print(f"  再造一块本机构成的({time.perf_counter() - t:.1f}s,也不算)\n")
 
-    st = reader.stats
-    rate = total / secs
-    print(f"{'解析':<26} {secs:>7.2f}s   {total:,} 条   {rate:,.0f} 条/秒")
-    print(f"{'  其中 in_use':<26} {st.records_in_use:>12,}")
-    print(f"{'  fixup 失败':<26} {st.fixup_failures:>12,}")
-    print(f"{'  解析失败':<26} {st.parse_failures:>12,}")
-    print(f"{'  无名字':<26} {st.unnamed:>12,}")
+    n_chunks = N_RECORDS // CHUNK_RECORDS
 
-    if st.fixup_failures or st.parse_failures or st.unnamed:
+    # 两块都跑。顺序上后跑的那块占不到便宜也吃不到亏 —— 每块自己重建 bytearray,
+    # 缓存状态一样。真要怀疑就换个顺序再跑一遍。
+    secs_a, total_a, st_a = timed_pass(reader, template, n_chunks)
+    rate_a = report_pass("三条全认识", secs_a, total_a, st_a)
+    if st_a.fixup_failures or st_a.parse_failures or st_a.unnamed:
         print("\n⚠ 有失败 —— 量到的是失败路径的速度,不能用")
         return 2
 
-    print(f"\n对照 bench_mft_read.py 假定的 127,109 条/秒:{rate / 127_109:.2f}x")
-    print(f"按这个速率,C: 的 161 万条要 {N_RECORDS / rate:.1f}s")
-    print("\nC: 走 MFT 全程 100.5s 的账:")
-    print(f"  解析(本工具)              {N_RECORDS / rate:>5.1f}s")
-    print(f"  读 1.5 GiB(bench_nobuffering) 1.3s")
-    print(f"  _mft_to_scan_entries        11.6s")
-    print(f"  收集后五遍                    8.8s")
-    print(f"  ──────────────────────────────────")
-    print(f"  合计                        {N_RECORDS / rate + 1.3 + 11.6 + 8.8:>5.1f}s"
-          f"   (实测 100.5s)")
+    secs_b, total_b, st_b = timed_pass(reader, mixed, n_chunks)
+    rate_b = report_pass("本机构成", secs_b, total_b, st_b)
+    if st_b.fixup_failures or st_b.parse_failures or st_b.unnamed:
+        print("\n⚠ 有失败 —— 量到的是失败路径的速度,不能用")
+        return 2
+
+    print(f"\n本机构成反而**快** {rate_b / rate_a:.2f}x。不是记录变便宜了 —— 是四分之一的"
+          f"\n记录空闲,在「看在用位」那一步就走开了,以前它们还得先还原一遍 USA。"
+          f"\n目录身上那三条不认识的属性也只是走过去,不建属性头。")
+    print(f"按「本机构成」这个速率,161 万条要 {N_RECORDS / rate_b:.1f}s")
+    print("\n注:这里量的只是解析。整次扫描的账在 tools/prof_scan_stages.py"
+          "\n(collect_entries 占 83.1%)和 tools/prof_collect_stages.py"
+          "\n(collect 里 read_entries 占 89.8%)。别拿这个数直接当扫描时间。")
     return 0
 
 

@@ -35,6 +35,14 @@ CHUNK_RECORDS = 8192
 WOF_STREAM = "wofcompresseddata"
 WOF_STREAM_CHARS = len(WOF_STREAM)
 
+#: 下面那个 for 循环认得的类型码,一个不多。传给 iter_attributes 让它别为
+#: 别的类型建属性头 —— 目录身上挂着 $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP,
+#: 每条都建一个 16 字段的对象再丢掉。加类型码时**这里和循环里要一起加**:
+#: 只加循环不加这里,那个分支就永远进不去(而且不报错,只是数字变小)。
+_WANTED_ATTRS = frozenset(
+    (A.ATTR_STANDARD_INFORMATION, A.ATTR_FILE_NAME, A.ATTR_DATA)
+)
+
 
 @dataclass(slots=True)
 class FileEntry:
@@ -132,18 +140,22 @@ class MftReader:
         返回 (条目, 扩展记录的大小贡献)。两者都可能为 None。
         扩展贡献形如 (基记录号, 分配大小, 逻辑大小)。
         """
-        magic = bytes(buf[offset : offset + 4])
-        if magic != A.MAGIC_FILE:
+        # startswith 而不是切片比较:切一次就多一个 bytes 对象,
+        # 而这行每条记录都要走一遍(本机 161 万次)
+        if not buf.startswith(A.MAGIC_FILE, offset):
             # BAAD 或全零(未分配)都属正常,不算错误
             return None, None
 
         self.stats.records_seen += 1
-        try:
-            A.apply_fixups(buf, offset, self.record_size, self.sector_size)
-        except A.FixupError:
-            self.stats.fixup_failures += 1
-            return None, None
 
+        # 先解头、先看在用位,**再**做 fixup —— 空闲记录不值得还原 USA
+        # (本机 161 万条里 40 万条是空闲的)。
+        #
+        # 这么排是可以证明的,不是「试了没出事」:USA 替换动的是每个扇区最后
+        # 两字节,第一个坑在 sector_size - 2;扇区最小 512,所以第一个坑在 510,
+        # 而记录头一共 48 字节(A._REC_HEADER.size),整个头都在坑下面。
+        # tests/test_parse_fast_path.py 把这个算术钉住了 —— 记录头哪天跨过去,
+        # 那里会先响。
         try:
             header = A.parse_record_header(buf, offset)
         except Exception:
@@ -153,6 +165,12 @@ class MftReader:
         if not header.in_use:
             return None, None
         self.stats.records_in_use += 1
+
+        try:
+            A.apply_fixups(buf, offset, self.record_size, self.sector_size)
+        except A.FixupError:
+            self.stats.fixup_failures += 1
+            return None, None
 
         record_number = header.record_number
         # 有些卷的记录号字段不可靠,以序号位置为准
@@ -167,7 +185,9 @@ class MftReader:
         has_data = False
         wof = False
 
-        for attr, attr_off in A.iter_attributes(buf, header, offset, self.record_size):
+        for attr, attr_off in A.iter_attributes(
+            buf, header, offset, self.record_size, _WANTED_ATTRS
+        ):
             code = attr.type_code
             if code == A.ATTR_STANDARD_INFORMATION:
                 std = A.parse_standard_information(buf, attr, attr_off)

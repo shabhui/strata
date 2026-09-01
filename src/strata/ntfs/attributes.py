@@ -68,6 +68,8 @@ _TIME_MAX = 4_102_444_800.0
 # 预编译,解析热路径上省下大量开销
 _U16 = struct.Struct("<H")
 _U32 = struct.Struct("<I")
+# 属性头开头的类型码 + 长度。一次取两个,省掉热路径上的第二次 unpack_from。
+_U32_PAIR = struct.Struct("<II")
 _U64 = struct.Struct("<Q")
 # 记录头布局:magic(0x00) usa_offset(0x04) usa_count(0x06) lsn(0x08)
 # sequence(0x10) hard_links(0x12) attrs_offset(0x14) flags(0x16)
@@ -75,6 +77,9 @@ _U64 = struct.Struct("<Q")
 # 填充(0x2A) record_number(0x2C) —— 共 0x30 字节
 _REC_HEADER = struct.Struct("<4sHHQHHHHIIQHHI")
 _ATTR_COMMON = struct.Struct("<IIBBHHH")
+# 公共头偏移 8 起的那五个字段。类型码和长度在它前面单独取 —— 见
+# iter_attributes:不要的属性只需要长度就能跳过,不该为它们解满七个字段。
+_ATTR_TAIL = struct.Struct("<BBHHH")
 _ATTR_RESIDENT = struct.Struct("<IH")
 _ATTR_NONRESIDENT = struct.Struct("<QQHHIQQQ")
 _STD_INFO = struct.Struct("<QQQQI")
@@ -220,40 +225,61 @@ class AttributeHeader:
         return bool(self.flags & 0x8000)
 
 
-def iter_attributes(buf: bytes | bytearray | memoryview, header: RecordHeader, offset: int, record_size: int):
-    """依次产出 (属性头, 属性起始偏移)。遇到不合理的长度就停,不抛异常。"""
+def iter_attributes(
+    buf: bytes | bytearray | memoryview,
+    header: RecordHeader,
+    offset: int,
+    record_size: int,
+    wanted: frozenset[int] | set[int] | None = None,
+):
+    """依次产出 (属性头, 属性起始偏移)。遇到不合理的长度就停,不抛异常。
+
+    wanted 给一个类型码集合时,只有集合里的类型会产出 —— 别的连 AttributeHeader
+    都不建,按 length 跳过就算了。这是为热路径准备的:_parse_record 只认三种
+    类型码,而目录身上还挂着 $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP,
+    120 万条记录乘四五条属性,白建的是五六百万个 16 字段的对象。
+
+    **默认不过滤**,而且空集合是「什么都不要」不是「不过滤」(所以判的是
+    `is None` 而不是真值)—— 探针工具要把每条属性都打出来,把默认改了它们
+    就少东西;而调用方用集合运算算 wanted 时,算出空集是很自然的事。
+
+    长度校验在过滤**之前**:一条属性的 length 不可信,它后面所有属性的位置
+    就都不可信了,跟这条要不要没关系。
+    """
     pos = offset + header.attrs_offset
     limit = offset + min(header.used_size or record_size, record_size)
 
-    while pos + 4 <= limit:
-        type_code = _U32.unpack_from(buf, pos)[0]
+    while pos + 8 <= limit:
+        type_code, length = _U32_PAIR.unpack_from(buf, pos)
         if type_code == ATTR_END:
             return
         if pos + _ATTR_COMMON.size > limit:
             return
 
+        # 长度必须推进且不越界,否则视为损坏
+        if length < _ATTR_COMMON.size or pos + length > limit:
+            return
+
+        if wanted is not None and type_code not in wanted:
+            pos += length
+            continue
+
         (
-            type_code,
-            length,
             non_resident,
             name_length,
             name_offset,
             flags,
             attr_id,
-        ) = _ATTR_COMMON.unpack_from(buf, pos)
-
-        # 长度必须推进且不越界,否则视为损坏
-        if length < _ATTR_COMMON.size or pos + length > limit:
-            return
+        ) = _ATTR_TAIL.unpack_from(buf, pos + 8)
 
         attr = AttributeHeader(
-            type_code=type_code,
-            length=length,
-            non_resident=bool(non_resident),
-            name_length=name_length,
-            name_offset=name_offset,
-            flags=flags,
-            attr_id=attr_id,
+            type_code,
+            length,
+            bool(non_resident),
+            name_length,
+            name_offset,
+            flags,
+            attr_id,
         )
 
         if non_resident:
