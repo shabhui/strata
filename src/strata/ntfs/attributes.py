@@ -23,6 +23,16 @@ ATTR_INDEX_ALLOCATION = 0xA0
 ATTR_END = 0xFFFFFFFF
 
 # ---- 记录头标志 ----
+#: 记录头里 flags 的偏移。_REC_HEADER 是 "<4sHHQHHHHIIQHHI",flags 排在
+#: magic(4) + usa_offset(2) + usa_count(2) + lsn(8) + sequence(2)
+#: + hard_link_count(2) + attrs_offset(2) 后面 = 22。
+#:
+#: 热路径拿它先看在用位:MFT_RECORD_IN_USE 是最低位,小端下就在这一个字节里,
+#: 所以空闲记录连 RecordHeader 都不必建(本机 161 万条里 40 万条是空闲的)。
+#: 这个偏移是硬编码的,tests/test_parse_fast_path.py 拿 parse_record_header
+#: 的结果对着钉住它 —— 字段顺序变了那里会响。
+REC_FLAGS_OFFSET = 22
+
 MFT_RECORD_IN_USE = 0x0001
 MFT_RECORD_IS_DIRECTORY = 0x0002
 
@@ -70,6 +80,8 @@ _U16 = struct.Struct("<H")
 _U32 = struct.Struct("<I")
 # 属性头开头的类型码 + 长度。一次取两个,省掉热路径上的第二次 unpack_from。
 _U32_PAIR = struct.Struct("<II")
+# usa_offset + usa_count,它们在记录头里是相邻的两个 u16。一次取两个。
+_USA_PAIR = struct.Struct("<HH")
 _U64 = struct.Struct("<Q")
 # 记录头布局:magic(0x00) usa_offset(0x04) usa_count(0x06) lsn(0x08)
 # sequence(0x10) hard_links(0x12) attrs_offset(0x14) flags(0x16)
@@ -168,14 +180,28 @@ class FixupError(Exception):
     """更新序列数组校验失败,记录不可信。"""
 
 
-def apply_fixups(buf: bytearray, offset: int, record_size: int, sector_size: int = 512) -> None:
+def apply_fixups(
+    buf: bytearray,
+    offset: int,
+    record_size: int,
+    sector_size: int = 512,
+    header: RecordHeader | None = None,
+) -> None:
     """就地还原更新序列数组做的替换。
 
     NTFS 把每个扇区最后两字节换成了 USN,原值存在数组里。
     不还原就解析会读到错误的字节 —— 这一步不是可选的。
+
+    header 给了就从里面取 usa_offset / usa_count,不再从 buf 里读一遍 ——
+    热路径上的调用方(mft._parse_record)紧接着就解过头了,那两个字段就在里面。
+    不给还是自己读:$MFT 自己那条记录和探针工具是**先 fixup 再解头**的,
+    顺序反过来,手上没有头。
     """
-    usa_offset = _U16.unpack_from(buf, offset + 4)[0]
-    usa_count = _U16.unpack_from(buf, offset + 6)[0]
+    if header is None:
+        usa_offset, usa_count = _USA_PAIR.unpack_from(buf, offset + 4)
+    else:
+        usa_offset = header.usa_offset
+        usa_count = header.usa_count
     if usa_count == 0:
         return
     if usa_offset + usa_count * 2 > record_size:

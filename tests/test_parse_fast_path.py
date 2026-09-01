@@ -56,6 +56,21 @@
     顺带补一处**测试的**空子:原来 FixupTest 三条用例都只动偏移 510,也就是
     第一个扇区。只查第一个扇区的写法能让那三条全绿。下面按第二个扇区也钉一条。
 
+近道五:在用位读一个字节,别为空闲记录建整个记录头。
+
+    近道一已经让空闲记录不做 fixup 了,但它还是要先建一个 13 字段的 RecordHeader
+    才能看到在用位 —— 而 MFT_RECORD_IN_USE 是 flags 的**最低位**,flags 在偏移 22,
+    读一个字节就够。本机 161 万条里 40 万条空闲,就是 40 万个白建的记录头。
+
+    偏移 22 是硬编码的,所以下面拿 parse_record_header 的结果对着钉住它 ——
+    记录头的字段顺序哪天变了,这里会响,而不是安静地把在用位读成别的东西。
+
+近道六:fixup 不重读 usa_offset / usa_count。
+
+    调用方(_parse_record)紧接着就解了记录头,那两个字段就在头里。apply_fixups
+    再从 buf 里读一遍是白读。所以它多收一个可选的 header 参数;不给还是自己读,
+    因为 $MFT 自己那条记录和探针工具是先 fixup 再解头的,顺序反过来。
+
 这个文件钉的是「近道没改变结果」,不是速度。速度归 bench_parse_record.py。
 """
 
@@ -404,6 +419,79 @@ class FixupChecksEverySectorTest(unittest.TestCase):
         struct.pack_into("<H", buf, RECORD_SIZE + 1022, 0xDEAD)
         with self.assertRaises(A.FixupError):
             A.apply_fixups(buf, RECORD_SIZE, RECORD_SIZE, 512)
+
+
+class FlagsBytePrecheckTest(unittest.TestCase):
+    """偏移 22 的最低位就是在用位 —— 这条断言是那个硬编码偏移的全部依据。"""
+
+    CASES = ((0x0000, False), (0x0001, True), (0x0002, False), (0x0003, True))
+
+    def test_the_byte_agrees_with_parse_record_header(self):
+        for flags, want in self.CASES:
+            raw = bytearray(fx.make_mft_record(
+                record_number=44, attributes=[fx.attr_file_name(name="a")], flags=flags
+            ))
+            header = A.parse_record_header(raw, 0)
+            self.assertIs(header.in_use, want, f"flags={flags:#06x}")
+            byte_says = bool(raw[A.REC_FLAGS_OFFSET] & A.MFT_RECORD_IN_USE)
+            self.assertIs(
+                byte_says, header.in_use,
+                f"flags={flags:#06x} 时偏移 {A.REC_FLAGS_OFFSET} 那个字节和记录头不一致",
+            )
+
+    def test_it_works_for_records_not_at_offset_zero(self):
+        """记录在块里的第 n 条时,偏移要跟着记录走。"""
+        raw = fx.make_mft_record(
+            record_number=45, attributes=[fx.attr_file_name(name="a")], flags=0x0000
+        )
+        buf = bytearray(RECORD_SIZE) + bytearray(raw)
+        header = A.parse_record_header(buf, RECORD_SIZE)
+        self.assertFalse(header.in_use)
+        self.assertFalse(bool(buf[RECORD_SIZE + A.REC_FLAGS_OFFSET] & A.MFT_RECORD_IN_USE))
+
+    def test_flags_offset_is_below_the_first_usa_slot(self):
+        """顺带:这个字节也得在 fixup 坑之外,否则先读它就不成立(见近道一)。"""
+        self.assertLess(A.REC_FLAGS_OFFSET + 1, 512 - 2)
+
+
+class FixupTakesTheHeaderTest(unittest.TestCase):
+    """给了记录头就别重读 usa_offset / usa_count,但结果必须一模一样。"""
+
+    def record(self) -> bytes:
+        return fx.make_mft_record(
+            record_number=46, attributes=[fx.attr_file_name(name="a.txt")]
+        )
+
+    def test_same_bytes_with_and_without_header(self):
+        raw = self.record()
+        without = bytearray(raw)
+        A.apply_fixups(without, 0, RECORD_SIZE, 512)
+        with_hdr = bytearray(raw)
+        A.apply_fixups(with_hdr, 0, RECORD_SIZE, 512,
+                       A.parse_record_header(with_hdr, 0))
+        self.assertEqual(bytes(without), bytes(with_hdr))
+
+    def test_still_raises_when_usn_mismatches(self):
+        buf = bytearray(self.record())
+        struct.pack_into("<H", buf, 1022, 0xDEAD)
+        header = A.parse_record_header(buf, 0)
+        with self.assertRaises(A.FixupError):
+            A.apply_fixups(buf, 0, RECORD_SIZE, 512, header)
+
+    def test_still_raises_on_absurd_usa_count(self):
+        buf = bytearray(self.record())
+        struct.pack_into("<H", buf, 6, 900)
+        header = A.parse_record_header(buf, 0)
+        with self.assertRaises(A.FixupError):
+            A.apply_fixups(buf, 0, RECORD_SIZE, 512, header)
+
+    def test_no_usa_is_still_a_no_op(self):
+        buf = bytearray(self.record())
+        struct.pack_into("<H", buf, 6, 0)
+        header = A.parse_record_header(buf, 0)
+        before = bytes(buf)
+        A.apply_fixups(buf, 0, RECORD_SIZE, 512, header)
+        self.assertEqual(bytes(buf), before)
 
 
 if __name__ == "__main__":

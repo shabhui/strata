@@ -148,26 +148,28 @@ class MftReader:
 
         self.stats.records_seen += 1
 
-        # 先解头、先看在用位,**再**做 fixup —— 空闲记录不值得还原 USA
-        # (本机 161 万条里 40 万条是空闲的)。
+        # 先看在用位,再解头,**最后**才做 fixup —— 空闲记录既不值得还原 USA,
+        # 也不值得建一个 13 字段的记录头(本机 161 万条里 40 万条是空闲的)。
+        # 在用位是 flags 的最低位,小端下就在偏移 22 那一个字节里。
         #
-        # 这么排是可以证明的,不是「试了没出事」:USA 替换动的是每个扇区最后
-        # 两字节,第一个坑在 sector_size - 2;扇区最小 512,所以第一个坑在 510,
-        # 而记录头一共 48 字节(A._REC_HEADER.size),整个头都在坑下面。
-        # tests/test_parse_fast_path.py 把这个算术钉住了 —— 记录头哪天跨过去,
-        # 那里会先响。
+        # 「fixup 放到最后」是可以证明的,不是「试了没出事」:USA 替换动的是每个
+        # 扇区最后两字节,第一个坑在 sector_size - 2;扇区最小 512,所以第一个坑
+        # 在 510,而记录头一共 48 字节(A._REC_HEADER.size),整个头都在坑下面 ——
+        # fixup 前后读到的是同一个头。
+        # tests/test_parse_fast_path.py 把这个算术和那个偏移都钉住了。
+        if not buf[offset + A.REC_FLAGS_OFFSET] & A.MFT_RECORD_IN_USE:
+            return None, None
+        self.stats.records_in_use += 1
+
         try:
             header = A.parse_record_header(buf, offset)
         except Exception:
             self.stats.parse_failures += 1
             return None, None
 
-        if not header.in_use:
-            return None, None
-        self.stats.records_in_use += 1
-
         try:
-            A.apply_fixups(buf, offset, self.record_size, self.sector_size)
+            # 头已经在手上,别让它再读一遍 usa_offset / usa_count
+            A.apply_fixups(buf, offset, self.record_size, self.sector_size, header)
         except A.FixupError:
             self.stats.fixup_failures += 1
             return None, None
