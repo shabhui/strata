@@ -350,9 +350,75 @@ def safe_day(ts: float | None) -> str | None:
     if value is None:
         return None
     try:
-        return _time.strftime("%Y-%m-%d", _time.localtime(value))
+        tm = _time.localtime(value)
     except (OSError, OverflowError, ValueError):
         return None
+    # 不用 strftime。理由和 day_timestamp 不用 strptime 一样(见下面那段注释):
+    # 格式是我们自己定的三段数字,不需要通用格式化器 —— 而 strftime 每次都要
+    # 查 locale、解析格式串。本机 82 万个文件上量下来 1.61s → 0.79s。
+    # 年份一定是四位:safe_ts 把范围掐在 [TS_MIN, TS_MAX] = [1970, 2100]。
+    return f"{tm.tm_year:04d}-{tm.tm_mon:02d}-{tm.tm_mday:02d}"
+
+
+def day_memo():
+    """返回一个和 safe_day 行为完全相同、但会记住算过的日子的函数。
+
+    给 scan/tree.py 的 build_buckets 用:它对每个文件调一次,本机 82 万次,
+    而贵的那一步是 time.localtime()(时区换算)。82 万个时间戳、同进程交错量
+    三轮:safe_day 0.93s,这个 0.65s,**1.45x**。
+
+    (别拿「2.3x」那个数:那是两个裸函数比出来的,两边都没走 safe_ts。
+    加上 safe_ts 之后两边都多一份固定开销,倍数自然被压下来 —— 1.45x 才是
+    调用方真能拿到的。)
+
+    为什么不做成模块级缓存、让 safe_day 自己变快:那样缓存会跨整个进程活着,
+    机器改了时区就开始给出旧答案 —— 而这里的命中率本来就来自「一次扫描内部
+    的时间聚集」,用完就扔正好。safe_day 本身一个字没动,它别的调用方
+    (scan/changes.py)行为不变。
+
+    键是 UTC 日序号(int(v) // 86400,便宜),值是那个 UTC 日里出现过的**当地日
+    窗口**。窗口不是按固定宽度切的,是拿 localtime 真算出来的当地午夜当起点 ——
+    这一点是刻意的:按「15 分钟整数倍」之类的固定粒度切会快一点,但那假设当地
+    UTC 偏移是那个粒度的整数倍,而 safe_ts 允许的 [1970, 2100] 里这**不成立**
+    (Africa/Monrovia 到 1972 年一直是 UTC-00:44:30)。偏移不是整数倍时,跨当地
+    午夜的那批文件会被分到错误的一天,而且不报错。
+
+    窗口宽度取 79200 秒 = **22** 小时,不是 23。常见的夏令时跳一小时、最短的一天
+    23 小时,按 23 小时算看着刚好 —— 但有跳两小时的:Antarctica/Troll 每年三月
+    从 +00 直接到 +02,那天只有 22 小时。按 23 小时切,那一天最后一小时的文件会
+    拿到前一天的日期,而且不报错。少一小时的命中率换一条不依赖「跳几小时」的规则。
+
+    起点用 int(value) 取整后再减,这样它是**整秒的当地午夜**,而不是「午夜之后
+    不到一秒」;右端用 `<` 不是 `<=`,不然最短那天的末尾会多出一秒落进窗口。
+    这两处在没有夏令时的机器上都测不出来(Windows 没有 time.tzset(),没法在
+    进程里假造时区),所以它们靠的是上面这段推理,不是靠测试兜着 ——
+    tests/test_bucket_fast_path.py 里把这件事写明了。
+    """
+    windows_by_utc_day: dict[int, list[tuple[int, int, str]]] = {}
+
+    def day(ts: float | None) -> str | None:
+        value = safe_ts(ts)
+        if value is None:
+            return None
+        key = int(value) // 86400
+        windows = windows_by_utc_day.get(key)
+        if windows is None:
+            windows = []
+            windows_by_utc_day[key] = windows
+        else:
+            for lo, hi, text in windows:
+                if lo <= value < hi:
+                    return text
+        try:
+            tm = _time.localtime(value)
+        except (OSError, OverflowError, ValueError):
+            return None
+        text = f"{tm.tm_year:04d}-{tm.tm_mon:02d}-{tm.tm_mday:02d}"
+        midnight = int(value) - (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec)
+        windows.append((midnight, midnight + 79200, text))
+        return text
+
+    return day
 
 
 def day_timestamp(day: str, hour: int = 0) -> float | None:

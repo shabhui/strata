@@ -68,6 +68,10 @@ def attribution_of(path: str, depth: int = config.ATTRIBUTION_DEPTH) -> str:
     3 段能区分到 `Users\\alice\\AppData` 和 `Program Files\\Steam\\steamapps`,
     比只看顶层目录有用得多。
     """
+    # 别改成「两次 find + 一次切片」—— 试过,**慢 1.7 倍**(82 万条路径
+    # 0.18s → 0.31s,同进程交错量三轮)。看着 split 要建列表再 join、显得比
+    # 找两个下标浪费,但 split(maxsplit) 是一次 C 调用,而 find 循环每轮都是
+    # 解释器在跑。数分配次数不等于量时间。
     if path == "":
         return ""
     parts = path.split("\\", depth)
@@ -261,6 +265,9 @@ def build_buckets(
     这样每天的总量仍然准确,只是细分粒度变粗。
     """
     raw: dict[tuple[str, str], tuple[int, int]] = {}
+    # 记忆化的 safe_day。行为和 config.safe_day 一样,只是记住算过的日子 ——
+    # 这一行调用要走 82 万次,而贵的是里面的 time.localtime()。2.3x,见 day_memo。
+    safe_day = config.day_memo()
 
     for e in entries:
         if e.is_dir or e.bytes <= 0:
@@ -268,7 +275,7 @@ def build_buckets(
         stamp = e.created if e.created is not None else e.modified
         # 坏时间戳直接跳过。系统盘上 FILETIME 为 0 或写着未来年份的文件不少,
         # 让它们参与分桶只会把时间轴污染成 1601 年的一根巨柱
-        day = config.safe_day(stamp)
+        day = safe_day(stamp)
         if day is None:
             continue
         attribution = attribution_of(e.path, attribution_depth)
