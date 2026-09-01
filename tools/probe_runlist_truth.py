@@ -17,6 +17,24 @@ allocated_size,把运行列表走一遍,只把真正分配了簇的段加起来�
     运行列表里的实际段    只数非稀疏段(lcn 不为空)的簇
     GetCompressedFileSizeW   系统给的真实占盘,判据
 
+实测结果(kernel32.dll,扩展记录 729,364):
+
+    $DATA(未命名)              allocated 0.81M  运行列表 0.00M  1 段,全稀疏
+    $DATA:"WofCompressedData"  allocated 0.45M  运行列表 0.45M
+    系统报真实占盘 0.45M   → 运行列表 ✓ 对上;allocated ✗ 多 0.81M
+
+幻影流是一整段稀疏,所以走运行列表自然得 0。这条对 WOF 成立。
+
+⚠ **这个工具还有个没修的毛病,别拿它的空结果当结论。**
+按 base_reference 反查扩展记录,只对 kernel32.dll 生效;notepad.exe 和
+$UsnJrnl 都查不到(而 probe_wof.py 顺着 $ATTRIBUTE_LIST 明明找到了
+notepad 的扩展记录 714,256)。所以「$UsnJrnl 只有 $Max」是反查漏了,
+不是它真的没有 $J。要查 $UsnJrnl 得改走 $ATTRIBUTE_LIST 那条路。
+
+顺带一个已经修掉的坑:硬链接会让两个路径拿到同一个记录号,原来直接覆盖
+targets,于是 notepad.exe 那一栏显示的其实是 kernel32.dll 的流。现在遇到
+重号会报出来并跳过 —— 一个悄悄张冠李戴的诊断工具比没有工具更坏。
+
 ⚠ 需要管理员权限。只读。
 
     tools\\run_elevated.bat probe_runlist_truth.py
@@ -92,54 +110,49 @@ def runlist_real_bytes(buf: bytearray, attr, off: int, bpc: int) -> tuple[int, i
     return real, len(runs), sparse
 
 
-def dump_record(vol: Volume, reader: MftReader, record: int, label: str,
-                path: str | None) -> None:
+def dump_records(vol: Volume, reader: MftReader, records: list[tuple[int, bytearray]],
+                 path: str | None) -> None:
+    """把一个文件的所有记录(基 + 扩展)里的 $DATA 逐条打出来。
+
+    必须带上扩展记录:实测 kernel32.dll 的基记录里一条 $DATA 都没有,
+    全在扩展记录 729,364 里;$UsnJrnl 的基记录只有一条小小的 $Max,
+    39.83 GiB 的 $J 也在扩展记录里。只看基记录会得到一片 0.00M。
+    """
     rec_size = reader.record_size
     bpc = vol.boot.bytes_per_cluster
-    off = None
-    seen = 0
-    want = record * rec_size
-    for run in reader.mft_runs():
-        span = run.length * bpc
-        if run.lcn is None:
-            seen += span
-            continue
-        if seen + span > want:
-            off = run.lcn * bpc + (want - seen)
-            break
-        seen += span
-    if off is None:
-        print(f"  定位不到记录 {record}")
-        return
-    raw = bytearray(vol.read(off, rec_size))
-    if bytes(raw[0:4]) != A.MAGIC_FILE:
-        print("  没有 FILE 标记")
-        return
-    A.apply_fixups(raw, 0, rec_size, vol.boot.bytes_per_sector)
-    header = A.parse_record_header(raw)
-
     alloc_total = 0
     runlist_total = 0
-    for attr, ao in A.iter_attributes(raw, header, 0, rec_size):
-        if attr.type_code != A.ATTR_DATA:
-            continue
-        size = A.parse_data_size(raw, attr, ao)
-        if size is None:
-            continue
-        name = A.attribute_name(raw, attr, ao)
-        real, nruns, nsparse = runlist_real_bytes(raw, attr, ao, bpc)
-        tag = f'"{name}"' if name else "(未命名)"
-        marks = []
-        if attr.sparse:
-            marks.append("稀疏位")
-        if attr.compressed:
-            marks.append("压缩位")
-        alloc_total += size.allocated
-        if real >= 0:
-            runlist_total += real
-        print(f"    $DATA{tag:<22} allocated {size.allocated/MIB:>10,.2f}M  "
-              f"运行列表 {real/MIB:>10,.2f}M  段 {nruns}(稀疏 {nsparse})"
-              f"  {','.join(marks)}")
+
+    for number, raw in records:
+        header = A.parse_record_header(raw)
+        kind = "扩展" if header.is_extension else "基"
+        printed = False
+        for attr, ao in A.iter_attributes(raw, header, 0, rec_size):
+            if attr.type_code != A.ATTR_DATA:
+                continue
+            size = A.parse_data_size(raw, attr, ao)
+            if size is None:
+                continue
+            name = A.attribute_name(raw, attr, ao)
+            real, nruns, nsparse = runlist_real_bytes(raw, attr, ao, bpc)
+            tag = f'"{name}"' if name else "(未命名)"
+            marks = []
+            if attr.sparse:
+                marks.append("稀疏位")
+            if attr.compressed:
+                marks.append("压缩位")
+            if size.resident:
+                marks.append("常驻")
+            alloc_total += size.allocated
+            if real >= 0:
+                runlist_total += real
+            printed = True
+            print(f"    [{kind}{number:>9,}] $DATA{tag:<20} "
+                  f"allocated {size.allocated/MIB:>10,.2f}M  "
+                  f"运行列表 {real/MIB:>10,.2f}M  段 {nruns}(稀疏 {nsparse})"
+                  f"  {','.join(marks)}")
+        if not printed:
+            print(f"    [{kind}{number:>9,}] 没有 $DATA")
 
     print(f"    合计  allocated {alloc_total/MIB:>10,.2f}M   "
           f"运行列表 {runlist_total/MIB:>10,.2f}M")
@@ -149,8 +162,54 @@ def dump_record(vol: Volume, reader: MftReader, record: int, label: str,
             print(f"    系统报真实占盘 {actual/MIB:>10,.2f}M   ← 判据")
             for what, value in (("allocated", alloc_total),
                                 ("运行列表", runlist_total)):
-                mark = "✓ 对上" if abs(value - actual) <= 2 * bpc else "✗"
+                mark = "✓ 对上" if abs(value - actual) <= 2 * bpc else "✗ 差 " \
+                    f"{(value - actual)/MIB:+,.2f}M"
                 print(f"      {what:<10} {mark}")
+
+
+def collect_records(vol: Volume, reader: MftReader,
+                    targets: set[int]) -> dict[int, list[tuple[int, bytearray]]]:
+    """扫一遍 MFT,把属于 targets 的记录(基记录本身 + 指向它的扩展记录)收齐。"""
+    out: dict[int, list[tuple[int, bytearray]]] = {t: [] for t in targets}
+    rec_size = reader.record_size
+    bpc = vol.boot.bytes_per_cluster
+    scratch = bytearray(8192 * rec_size)
+    index = 0
+    for run in reader.mft_runs():
+        if run.lcn is None:
+            index += (run.length * bpc) // rec_size
+            continue
+        run_bytes = run.length * bpc
+        base = run.lcn * bpc
+        done = 0
+        while done < run_bytes:
+            take = min(len(scratch), run_bytes - done)
+            take -= take % rec_size
+            if take <= 0:
+                break
+            got = vol.read_into(base + done, take, scratch)
+            if not got:
+                break
+            for i in range(got // rec_size):
+                o = i * rec_size
+                if bytes(scratch[o : o + 4]) != A.MAGIC_FILE:
+                    continue
+                number = index + i
+                try:
+                    A.apply_fixups(scratch, o, rec_size, vol.boot.bytes_per_sector)
+                    header = A.parse_record_header(scratch, o)
+                except Exception:                        # noqa: BLE001
+                    continue
+                if not header.in_use:
+                    continue
+                owner = header.base_record_number if header.is_extension else number
+                if owner not in out:
+                    continue
+                # 复制出来:scratch 整趟复用,不复制的话后面全被覆盖
+                out[owner].append((number, bytearray(scratch[o : o + rec_size])))
+            index += got // rec_size
+            done += got
+    return out
 
 
 def find_by_name(vol: Volume, reader: MftReader, names: set[str]) -> dict[str, int]:

@@ -206,8 +206,25 @@ class MftReader:
             # 报的是整个逻辑区间,真实占用只有活动窗口那几十 MB。
             #
             # 所以这里维持原样。这不是「$J 该被丢掉」的理由,只是「按
-            # allocated_size 把它算进来更错」。真要算准得走运行列表只数非稀疏段,
-            # 那条还没在真盘上验过,没验过的规则不进代码。
+            # allocated_size 把它算进来更错」。
+            #
+            # 真要算准得走运行列表只数非稀疏段。这条规则**已经在真盘上验过一半**
+            # (tools/probe_runlist_truth.py,提权跑):
+            #
+            #   kernel32.dll  扩展记录 729,364
+            #     $DATA(未命名)              allocated 0.81M  运行列表 0.00M  1 段全稀疏
+            #     $DATA:"WofCompressedData"  allocated 0.45M  运行列表 0.45M
+            #     系统报真实占盘 0.45M  → 运行列表 ✓ 对上,allocated ✗ 多 0.81M
+            #
+            # 幻影流是**一整段稀疏**,所以走运行列表自然得 0 —— 不用按流名认
+            # WOF,规则自己就能得出正确答案。这比现在这套按名字匹配更根本。
+            #
+            # 没验的那一半是 $UsnJrnl 的 $J:它的基记录 77,516 里只有一条很小的
+            # $Max,$J 在哪条扩展记录上还没找到(那个工具按 base_reference 反查,
+            # 对 notepad.exe 也没找到,说明反查这条路本身还有问题)。
+            # 换成运行列表规则要动的是所有文件的字节口径,只验证了一半就上
+            # 不合算 —— 而且对总量的影响很小:WOF 那部分两种规则得出同一个数,
+            # 差别只在 probe_wof_shapes.py 里那 4 个「幻影在基记录」的文件(1.13G)。
             if has_data and (alloc or logical):
                 return None, (
                     header.base_record_number, alloc, named_alloc, logical, wof
