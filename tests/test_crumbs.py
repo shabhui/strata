@@ -46,8 +46,8 @@ eval(m[0]);
 const cases = [
   '',
   'Users',
-  'Users\\sbhui',
-  'Users\\sbhui\\Downloads',
+  'Users\\alice',
+  'Users\\alice\\Downloads',
   'Program Files\\Common Files\\microsoft shared',
 ];
 const out = {};
@@ -157,7 +157,7 @@ class TestCrumbTrail(unittest.TestCase):
         proc = subprocess.run(
             [NODE, "-e", PROBE.replace(
                 "const cases = [",
-                "const cases = ['C:\\\\Users\\\\sbhui', 'C:\\\\Users\\\\', 'C:\\\\', ",
+                "const cases = ['C:\\\\Users\\\\alice', 'C:\\\\Users\\\\', 'C:\\\\', ",
             )],
             capture_output=True, encoding="utf-8", errors="replace",
             env={**os.environ, "STRATA_APP_JS": str(APP_JS)},
@@ -166,8 +166,8 @@ class TestCrumbTrail(unittest.TestCase):
             raise AssertionError(f"node 跑不起来:\n{proc.stderr}")
         got = json.loads(proc.stdout)
 
-        self.assertEqual([c["path"] for c in got["C:\\Users\\sbhui"]],
-                         ["", "Users", "Users\\sbhui"])
+        self.assertEqual([c["path"] for c in got["C:\\Users\\alice"]],
+                         ["", "Users", "Users\\alice"])
         self.assertEqual([c["path"] for c in got["C:\\Users\\"]], ["", "Users"])
         self.assertEqual([c["path"] for c in got["C:\\"]], [""])
 

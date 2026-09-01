@@ -9,7 +9,7 @@ Disk analyzers are everywhere, but they all answer "who is big right now". The q
 - Pure Python standard library, zero runtime dependencies
 - Local web UI, binds `127.0.0.1` only, nothing leaves the machine
 - Shows the last few days of growth on the day you install it (see the two history layers below)
-- Reads the NTFS MFT directly, so a full-drive scan usually takes seconds; falls back to a normal walk when it can't get the privilege
+- Reads the NTFS MFT directly: 20-25 seconds for a full scan of a million-file drive; falls back to a normal walk when it can't get the privilege
 - UI in English and Chinese. It follows your browser's language on first launch, and the button in the top bar (which shows the language you would switch *to*) overrides that and is remembered
 
 ## Two history layers

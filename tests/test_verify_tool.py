@@ -28,8 +28,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import verify_exe as V  # noqa: E402
 
-MEI = r"C:\Users\sbhui\AppData\Local\Temp\_MEI123456"
-DB_OK = r"C:\Users\sbhui\AppData\Local\Strata\strata.db"
+MEI = r"C:\Users\alice\AppData\Local\Temp\_MEI123456"
+DB_OK = r"C:\Users\alice\AppData\Local\Strata\strata.db"
 
 DOCTOR = ("Strata 自检\n"
           f"界面文件:{MEI}\\web\n"

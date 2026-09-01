@@ -107,7 +107,7 @@ class RelPathParamTest(unittest.TestCase):
     BACK = "\\"
 
     def test_already_clean_is_unchanged(self) -> None:
-        for raw in ("", "Users", "Users" + self.BACK + "sbhui"):
+        for raw in ("", "Users", "Users" + self.BACK + "alice"):
             with self.subTest(raw=raw):
                 self.assertEqual(api._rel_path_param(q(path=raw)), raw)
 
@@ -117,7 +117,7 @@ class RelPathParamTest(unittest.TestCase):
             "C:" + b + "Users": "Users",
             "C:" + b + "Users" + b: "Users",
             "C:" + b: "",
-            "c:" + b + "Users" + b + "sbhui": "Users" + b + "sbhui",
+            "c:" + b + "Users" + b + "alice": "Users" + b + "alice",
             "D:" + b + "games": "games",
         }
         for raw, want in cases.items():
@@ -126,8 +126,8 @@ class RelPathParamTest(unittest.TestCase):
 
     def test_forward_slashes_become_backslashes(self) -> None:
         self.assertEqual(
-            api._rel_path_param(q(path="c:/Users/sbhui")),
-            "Users" + self.BACK + "sbhui",
+            api._rel_path_param(q(path="c:/Users/alice")),
+            "Users" + self.BACK + "alice",
         )
 
     def test_strips_leading_and_trailing_separators(self) -> None:

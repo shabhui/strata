@@ -182,16 +182,16 @@ class TestStaleResponsesAreDropped(unittest.TestCase):
         got = run({
             "delays": {"tree@C:|": 80, "timeline": 80, "status": 2,
                        "hotspots": 2, "diff": 2, "changes": 2,
-                       "tree@C:|Users\\sbhui": 5},
+                       "tree@C:|Users\\alice": 5},
             "plan": [
                 {"op": "loadDrive", "drive": "C:", "opts": {"keepPath": True}},
                 {"op": "wait", "ms": 5},
-                {"op": "enterPath", "path": "Users\\sbhui"},
+                {"op": "enterPath", "path": "Users\\alice"},
             ],
         })
-        self.assertEqual(got["path"], "Users\\sbhui")
+        self.assertEqual(got["path"], "Users\\alice")
         self.assertEqual(
-            got["finalTree"], "C:|Users\\sbhui",
+            got["finalTree"], "C:|Users\\alice",
             f"手上是 {got['finalTree']},用户进的目录被整盘刷新覆盖了",
         )
 
