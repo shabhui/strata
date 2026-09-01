@@ -1151,6 +1151,34 @@ class HotspotsTest(AnalysisFixture):
         for g in hotspots.recently_grown(self.conn, sid, days=14, min_bytes=MB, now=now):
             self.assertGreaterEqual(g.days_old, 0, f"{g.path} 的 days_old 是负的")
 
+    def test_negative_age_guard_also_holds_at_the_api_boundary(self) -> None:
+        """上一条看的是数据类字段,这一条看**发出去的字典**。
+
+        两条都要有:GrowthSpot.as_dict() 少写一行 days_old,上一条断言照样绿
+        (它读的是 g.days_old),而 /api/hotspots 的响应里那个字段就没了 ——
+        真机上出过的 -1477.6 从此没人守。自带的前端不读这个字段,所以少了它
+        界面也不会报错,只是那个 bug 再回来时没有任何测试会响。
+        """
+        now = ts_at(0, hour=18)
+        sid = self.add_snapshot(
+            taken_at=now, scanned=900 * MB, dirs={"Fresh": 200 * MB},
+            newest_ctime=ts_at(-2),
+        )
+        db.insert_dirs(self.conn, sid, [db.DirRow(
+            path="Future", depth=1, bytes=600 * MB, own_bytes=600 * MB,
+            files=1, dirs=0, newest_ctime=now + 1478 * 86400,
+        )])
+        self.conn.commit()
+        spots = hotspots.recently_grown(
+            self.conn, sid, days=14, min_bytes=MB, now=now)
+        self.assertTrue(spots, "没有数据的话这条测试什么也没验到")
+        for g in spots:
+            payload = g.as_dict()
+            self.assertIn("days_old", payload,
+                          "as_dict 里没有 days_old —— 接口契约少了一个字段")
+            self.assertGreaterEqual(
+                payload["days_old"], 0, f"{payload['path']} 发出去的天数是负的")
+
     def test_recently_grown_keeps_mild_clock_skew(self) -> None:
         """超前几小时的留着 —— 跨机器拷来的文件常带对面的钟,那是正常产物。
 

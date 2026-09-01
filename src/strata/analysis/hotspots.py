@@ -83,6 +83,12 @@ class GrowthSpot:
     path: str
     bytes: int
     newest: float | None
+    # 自带的前端不读这个字段(它自己拿 newest 算),但**别顺手删掉**:
+    # 它是 /api/hotspots 响应的一部分,而且是那个负天数 bug 唯一能从外面看见的
+    # 地方 —— 真机上出过 -1477.6(源头是 IDM 写了个 2030 年的时间戳,详见
+    # config.FUTURE_TOLERANCE)。tests/test_analysis.py 有三处断言盯着它,
+    # 其中一条专门盯「不能是负数」。删了 as_dict 里这一行,断言还是绿的
+    # (它们看的是数据类字段),而接口那边就没人守了。
     days_old: float | None
 
     def as_dict(self) -> dict:
