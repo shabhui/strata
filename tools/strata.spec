@@ -33,9 +33,23 @@ a = Analysis(
     ],
     # 这些是运行时才 import 的(__main__ 里各个 cmd_* 都是函数内 import),
     # 静态分析能顺着找到,但写出来更保险:少一个就是运行到那条命令才崩。
+    #
+    # 这份清单自己栽过,值得写下来:里面曾有一条 strata.analysis.treemap —— 那个
+    # 模块**从来不存在**,源码里也没有任何地方 import 它。PyInstaller 找不到只
+    # 打一行 `ERROR: Hidden import not found` 就继续,exe 照样打出来照样能跑,
+    # 所以这条假条目安安稳稳待了很久。同时真实存在的 diff/hotspots/paths 三个
+    # 反倒没列 —— 它们能进 exe 全靠静态分析,而上面那句注释说的正是「不指望静态
+    # 分析」。于是这份清单当时的实际状态是:一条保护不存在的东西,三条该保护的
+    # 没保护,而它看起来在保护十个。
+    #
+    # 这和项目里那句「只会通过的检查比没有检查更糟」是同一件事:清单不报错,不
+    # 等于清单是对的。所以下面按 src/strata/analysis/ 的真实内容列全,并且
+    # tests/test_packaging.py 里加了一条:清单里每个名字都必须真能 import。
     hiddenimports=[
+        "strata.analysis.diff",
+        "strata.analysis.hotspots",
+        "strata.analysis.paths",
         "strata.analysis.timeline",
-        "strata.analysis.treemap",
         "strata.ntfs.volume",
         "strata.reveal",
         "strata.scan.changes",
