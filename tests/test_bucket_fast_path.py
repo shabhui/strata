@@ -196,6 +196,45 @@ class DayMemoMatchesSafeDayTest(unittest.TestCase):
         ts = 1_700_000_000.0
         self.assertEqual(a(ts), b(ts))
 
+    def test_one_local_day_never_holds_more_than_a_few_windows(self):
+        """同一个当地日问上一万次,窗口列表不能跟着长 —— 否则命中路径是 O(k²)。
+
+        这一条是从真机上一次 289 秒的扫描倒查回来的。D: 盘 114 万文件比 C: 的
+        82.5 万只多 38%,build_buckets 却从 2 秒涨到 **68 秒**,占整次扫描 76%。
+
+        原因是窗口宽度取 79200 秒(22 小时)而一个当地日有 24 小时:当地
+        22:00 之后的时间戳,自己建的窗口 [midnight, midnight+79200) 覆盖不到
+        自己。于是每一个都判不中、每一个都往同一个 UTC 日的列表里追加一条
+        永远不会命中的窗口,下一个再从头线性扫一遍这条越来越长的列表。
+
+        实测同一批 16,000 个时间戳:当地 12:00 那批 0.004s、窗口 1 条;
+        当地 23:00 那批 3.471s、窗口 3,601 条 —— 慢 868 倍。D: 是游戏/媒体盘,
+        大批文件是同一次深夜解压写进去的,整批砸在这个坑里;C: 是系统盘,
+        创建时间散在全天,所以一直没露出来。
+
+        测的是窗口条数而不是秒数:秒数在不同机器上没有可比的阈值,而
+        「一个当地日该有几条窗口」是个和机器无关的不变量 —— 夏令时最多把一天
+        切成两段偏移,所以 UTC 日跨界那两条之外,不该再有第三条。
+
+        这条正是那份变异清单里被判成「不是 bug」的第五项(「让缓存永不命中」)。
+        判它在正确性上不是 bug 是对的,但不命中并不等于「退化成直算」——
+        它还会追加,于是退化成平方。性能变异要靠性能不变量钉,不能靠比答案。
+        """
+        for hour in (0, 12, 22, 23):
+            memo = config.day_memo()
+            base = time.mktime((2026, 8, 15, hour, 0, 0, 0, 0, -1))
+            want = config.safe_day(base)
+            for i in range(10_000):
+                self.assertEqual(memo(base + i * 0.1), want)
+            windows = sum(
+                len(v) for v in memo.__closure__[0].cell_contents.values()
+            )
+            self.assertLessEqual(
+                windows, 4,
+                f"当地 {hour}:00 那批建了 {windows:,} 条窗口 —— "
+                f"命中路径每次都要线性扫完它,这是 O(k²)",
+            )
+
 
 class AttributionBehaviourTest(unittest.TestCase):
     """这个函数原来一条测试都没有。换写法的尝试被实测否掉了,行为照旧,

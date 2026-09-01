@@ -383,16 +383,31 @@ def day_memo():
     (Africa/Monrovia 到 1972 年一直是 UTC-00:44:30)。偏移不是整数倍时,跨当地
     午夜的那批文件会被分到错误的一天,而且不报错。
 
-    窗口宽度取 79200 秒 = **22** 小时,不是 23。常见的夏令时跳一小时、最短的一天
-    23 小时,按 23 小时算看着刚好 —— 但有跳两小时的:Antarctica/Troll 每年三月
-    从 +00 直接到 +02,那天只有 22 小时。按 23 小时切,那一天最后一小时的文件会
-    拿到前一天的日期,而且不报错。少一小时的命中率换一条不依赖「跳几小时」的规则。
+    右端也是**算出来的**,不是猜一个保守宽度。这一处栽过:原来固定取 79200 秒
+    = 22 小时,理由是「最短的一天可能只有 22 小时(Antarctica/Troll 三月跳两
+    小时),按 23 小时切会把那天末尾的文件分到前一天」。那个担心本身没错,错的是
+    拿它去换宽度 —— 一个当地日有 24 小时,22 小时的窗口覆盖不到 22:00 之后的
+    时间戳,而**建窗口的那个时间戳自己**就可能在 22:00 之后。于是它判不中自己,
+    每次都追加一条永不命中的窗口,下一个再从头线性扫一遍。O(k) 的命中路径变成
+    O(k²)。
+
+    真机代价:D: 盘 114 万文件比 C: 的 82.5 万只多 38%,build_buckets 却从 2 秒
+    涨到 68 秒 —— 占整次扫描 289 秒里的 76%。同一批 16,000 个时间戳,当地 12:00
+    那批 0.004s / 1 条窗口,当地 23:00 那批 3.471s / 3,601 条窗口,慢 868 倍。
+    D: 是游戏盘,大批文件是同一次深夜解压写进去的;C: 是系统盘,创建时间散在
+    全天,所以这个坑一直没露出来。
+
+    现在的做法:试着把右端放到当地午夜 + 86400,然后**拿 localtime 确认那一刻
+    是不是还在同一天**。是就用 86400(绝大多数日子),不是就说明这天被夏令时
+    缩短了,退回去按小时收窄。多花的一到两次 localtime 只在每个新的当地日发生
+    一次,而换来的是「一天一条窗口」——「跳几小时」不再需要被猜中,因为不再猜。
 
     起点用 int(value) 取整后再减,这样它是**整秒的当地午夜**,而不是「午夜之后
-    不到一秒」;右端用 `<` 不是 `<=`,不然最短那天的末尾会多出一秒落进窗口。
+    不到一秒」;右端用 `<` 不是 `<=`,不然一天的末尾会多出一秒落进窗口。
     这两处在没有夏令时的机器上都测不出来(Windows 没有 time.tzset(),没法在
     进程里假造时区),所以它们靠的是上面这段推理,不是靠测试兜着 ——
-    tests/test_bucket_fast_path.py 里把这件事写明了。
+    tests/test_bucket_fast_path.py 里把这件事写明了。而「一个当地日只该有几条
+    窗口」是和时区无关的不变量,那一条有测试钉着。
     """
     windows_by_utc_day: dict[int, list[tuple[int, int, str]]] = {}
 
@@ -415,7 +430,26 @@ def day_memo():
             return None
         text = f"{tm.tm_year:04d}-{tm.tm_mon:02d}-{tm.tm_mday:02d}"
         midnight = int(value) - (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec)
-        windows.append((midnight, midnight + 79200, text))
+        # 右端从整天试起,再确认那一刻还在不在同一天。夏令时缩短的那天会在这里
+        # 被逮到并收窄,而不是靠事先猜一个够小的宽度 —— 猜小了就覆盖不到建窗口
+        # 的那个时间戳自己,窗口列表会无限追加(见文档里那 68 秒)。
+        end = midnight + 86400
+        while end > midnight:
+            try:
+                tm_end = _time.localtime(end - 1)
+            except (OSError, OverflowError, ValueError):
+                # 靠近 TS_MAX 时 localtime 可能表示不了,收窄到能表示为止
+                end -= 3600
+                continue
+            same_day = (
+                tm_end.tm_year == tm.tm_year
+                and tm_end.tm_mon == tm.tm_mon
+                and tm_end.tm_mday == tm.tm_mday
+            )
+            if same_day:
+                break
+            end -= 3600
+        windows.append((midnight, end, text))
         return text
 
     return day
