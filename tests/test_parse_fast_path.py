@@ -31,6 +31,31 @@
     属性都打出来(tools/probe_wof.py),tests/test_ntfs_parsing.py 也指着全量
     行为 —— 默认变了它们就错了。
 
+近道三:时间戳存原始 FILETIME,取的时候才换算。
+
+    cProfile 量下来,解析 149,600 条在用记录调了 filetime_to_unix **897,600 次**
+    —— 每条 6 次:$STANDARD_INFORMATION 四个 + $FILE_NAME 两个。而 mft.py 只用
+    得上两个:
+
+      * accessed 和 mft_changed:全仓库(src/tests/tools)没有一处读它们
+      * $FILE_NAME 的 created / modified:只在 $STANDARD_INFORMATION 缺失时兜底,
+        而 $STANDARD_INFORMATION 是每条记录都有的
+
+    6 次里 4 次白转。所以两个数据类都改成存原始 FILETIME,created 之类变成
+    property,取的时候才算。**不删** accessed / mft_changed:它们确实在记录里,
+    删了就再也问不出来,而现在这样留着不花钱。
+
+    filetime_to_unix(0) 本来就返回 None,所以默认值 0 和以前的默认 None 是
+    同一个意思 —— 语义没变。
+
+近道四:fixup 校验不切片。
+
+    apply_fixups 原来每个扇区做两次 bytes(buf[t:t+2]),1024 字节的记录有两个
+    扇区,120 万条记录就是几百万个两字节对象。改成直接比整数。
+
+    顺带补一处**测试的**空子:原来 FixupTest 三条用例都只动偏移 510,也就是
+    第一个扇区。只查第一个扇区的写法能让那三条全绿。下面按第二个扇区也钉一条。
+
 这个文件钉的是「近道没改变结果」,不是速度。速度归 bench_parse_record.py。
 """
 
@@ -39,6 +64,7 @@ from __future__ import annotations
 import dataclasses
 import struct
 import unittest
+import unittest.mock
 
 from strata.ntfs import attributes as A
 from strata.ntfs import mft
@@ -248,6 +274,136 @@ class DirectoriesStillParseTest(unittest.TestCase):
         self.assertTrue(entries[20].is_dir)
         self.assertEqual(entries[20].bytes, 0, "目录不该算数据占用")
         self.assertEqual(entries[21].bytes, 4096, "目录里的文件大小变了")
+
+
+class TimestampsAreLazyTest(unittest.TestCase):
+    """解析的时候一次都不换算,取的时候才算 —— 而且算出来的还是原来那个数。"""
+
+    SI_TIMES = dict(
+        created=1_600_000_000.0, modified=1_650_000_000.0,
+        mft_changed=1_660_000_000.0, accessed=1_670_000_000.0,
+    )
+    FN_TIMES = dict(created=1_500_000_000.0, modified=1_550_000_000.0)
+
+    def parsed(self):
+        raw = fx.make_mft_record(
+            record_number=40,
+            attributes=[
+                fx.attr_standard_information(**self.SI_TIMES),
+                fx.attr_file_name(name="t.bin", parent=5, **self.FN_TIMES),
+            ],
+        )
+        buf = bytearray(raw)
+        A.apply_fixups(buf, 0, RECORD_SIZE, 512)
+        header = A.parse_record_header(buf, 0)
+        std = fn = None
+        for attr, off in A.iter_attributes(buf, header, 0, RECORD_SIZE):
+            if attr.type_code == A.ATTR_STANDARD_INFORMATION:
+                std = A.parse_standard_information(buf, attr, off)
+            elif attr.type_code == A.ATTR_FILE_NAME:
+                fn = A.parse_file_name(buf, attr, off)
+        self.assertIsNotNone(std)
+        self.assertIsNotNone(fn)
+        return std, fn
+
+    def test_parsing_converts_no_filetime_at_all(self):
+        """六次换算里有四次是白干的,所以一次都别在解析时做。"""
+        with unittest.mock.patch.object(
+            A, "filetime_to_unix", wraps=A.filetime_to_unix
+        ) as spy:
+            self.parsed()
+            self.assertEqual(
+                spy.call_count, 0,
+                f"解析时换算了 {spy.call_count} 次时间 —— 应该等到取的时候再算",
+            )
+
+    def test_reading_converts_just_that_one(self):
+        std, _ = self.parsed()
+        with unittest.mock.patch.object(
+            A, "filetime_to_unix", wraps=A.filetime_to_unix
+        ) as spy:
+            std.created
+            self.assertEqual(spy.call_count, 1, "取一个时间换算了不止一次")
+
+    def test_standard_information_values_unchanged(self):
+        std, _ = self.parsed()
+        for field, want in self.SI_TIMES.items():
+            self.assertAlmostEqual(getattr(std, field), want, places=3, msg=field)
+
+    def test_file_name_values_unchanged(self):
+        _, fn = self.parsed()
+        for field, want in self.FN_TIMES.items():
+            self.assertAlmostEqual(getattr(fn, field), want, places=3, msg=field)
+
+    def test_attributes_field_still_plain(self):
+        """attributes 不是时间,别顺手也包成 property。"""
+        std, fn = self.parsed()
+        self.assertEqual(std.attributes, 0x20)
+        self.assertEqual(fn.attributes, 0x20)
+
+    def test_zero_filetime_still_means_none(self):
+        """默认 0 和以前的默认 None 得是同一个意思。
+
+        mft.py 那两行靠的是 `or` 兜底:`(std.created if std else None) or
+        best_name.created`。要是 0 换算出 0.0 而不是 None,`or` 照样会走兜底
+        (0.0 是假值),但 FileEntry 上就会留下 1601 年 —— 所以这条得钉住。
+        """
+        fn = A.FileNameInfo(parent=5, name="x", namespace=3,
+                            allocated_hint=0, real_hint=0, attributes=0)
+        self.assertIsNone(fn.created)
+        self.assertIsNone(fn.modified)
+
+    def test_end_to_end_entry_timestamps(self):
+        """整条路走下来,FileEntry 上的时间还是对的。"""
+        records = {
+            20: fx.make_mft_record(
+                record_number=20,
+                attributes=[fx.attr_standard_information(),
+                            fx.attr_file_name(name="d", parent=5)],
+                flags=0x0003,
+            ),
+            21: a_file(21, "t.bin", 20, 4096),
+        }
+        entries, _ = read_stats(records)
+        self.assertAlmostEqual(entries[21].created, 1_700_000_000.0, places=3)
+        self.assertAlmostEqual(entries[21].modified, 1_700_500_000.0, places=3)
+
+
+class FixupChecksEverySectorTest(unittest.TestCase):
+    """USA 校验得查每个扇区,不能只查第一个。
+
+    补的是**测试的**空子:原来 FixupTest 三条用例都只动偏移 510(第一个扇区),
+    所以「只查第一个扇区」的写法能让它们全绿。1024 字节的记录有两个扇区。
+    """
+
+    def record(self) -> bytearray:
+        return bytearray(fx.make_mft_record(
+            record_number=41, attributes=[fx.attr_file_name(name="a.txt")]
+        ))
+
+    def test_corrupt_second_sector_is_caught(self):
+        buf = self.record()
+        struct.pack_into("<H", buf, 1022, 0xDEAD)
+        with self.assertRaises(A.FixupError):
+            A.apply_fixups(buf, 0, RECORD_SIZE, 512)
+
+    def test_every_sector_tail_gets_restored(self):
+        buf = self.record()
+        for tail in (510, 1022):
+            self.assertEqual(struct.unpack_from("<H", buf, tail)[0], 0x1234,
+                             f"偏移 {tail} 上本该是 USN")
+        A.apply_fixups(buf, 0, RECORD_SIZE, 512)
+        for tail in (510, 1022):
+            self.assertEqual(struct.unpack_from("<H", buf, tail)[0], 0,
+                             f"偏移 {tail} 没还原")
+
+    def test_offset_records_are_checked_too(self):
+        """记录不在偏移 0 时,查的也得是那条记录自己的扇区。"""
+        buf = bytearray(RECORD_SIZE * 2)
+        buf[RECORD_SIZE:] = self.record()
+        struct.pack_into("<H", buf, RECORD_SIZE + 1022, 0xDEAD)
+        with self.assertRaises(A.FixupError):
+            A.apply_fixups(buf, RECORD_SIZE, RECORD_SIZE, 512)
 
 
 if __name__ == "__main__":

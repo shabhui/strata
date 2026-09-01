@@ -182,17 +182,21 @@ def apply_fixups(buf: bytearray, offset: int, record_size: int, sector_size: int
         raise FixupError(f"更新序列数组越界: offset={usa_offset} count={usa_count}")
 
     base = offset + usa_offset
-    usn = bytes(buf[base : base + 2])
+    # 按整数比,不切片。每个扇区原来要 bytes(buf[t:t+2]) 一次,1024 字节的记录
+    # 两个扇区,120 万条记录就是几百万个两字节对象 —— 纯粹为了比两个字节。
+    usn_lo = buf[base]
+    usn_hi = buf[base + 1]
     entries = usa_count - 1
     if entries * sector_size > record_size:
         raise FixupError(f"更新序列条目数 {entries} 超过记录能容纳的扇区数")
 
     for i in range(entries):
         tail = offset + (i + 1) * sector_size - 2
-        if bytes(buf[tail : tail + 2]) != usn:
+        if buf[tail] != usn_lo or buf[tail + 1] != usn_hi:
             raise FixupError(f"扇区 {i} 的 USN 不匹配,记录已损坏")
         src = base + 2 + i * 2
-        buf[tail : tail + 2] = buf[src : src + 2]
+        buf[tail] = buf[src]
+        buf[tail + 1] = buf[src + 1]
 
 
 @dataclass(slots=True)
@@ -304,11 +308,40 @@ def iter_attributes(
 
 @dataclass(slots=True)
 class StandardInfo:
-    created: float | None
-    modified: float | None
-    mft_changed: float | None
-    accessed: float | None
+    """$STANDARD_INFORMATION 的四个时间和属性位。
+
+    时间**存原始 FILETIME**,取的时候才换算 —— created 之类是 property。
+    理由是量出来的:解析一条记录要换算 6 次时间(这里 4 次 + $FILE_NAME 2 次),
+    而用得上的只有 2 次。accessed 和 mft_changed 全仓库没有一处读,
+    $FILE_NAME 那两个只在这里缺失时兜底(而这条属性每条记录都有)。
+    120 万条记录上就是几百万次白算。
+
+    **不删** accessed / mft_changed:它们确实在记录里,删了以后就再也问不出来,
+    而现在这样留着一分钱不花。字段顺序和 _STD_INFO 的解包顺序一致,所以下面
+    可以直接摊开构造。
+    """
+
+    created_ft: int
+    modified_ft: int
+    mft_changed_ft: int
+    accessed_ft: int
     attributes: int
+
+    @property
+    def created(self) -> float | None:
+        return filetime_to_unix(self.created_ft)
+
+    @property
+    def modified(self) -> float | None:
+        return filetime_to_unix(self.modified_ft)
+
+    @property
+    def mft_changed(self) -> float | None:
+        return filetime_to_unix(self.mft_changed_ft)
+
+    @property
+    def accessed(self) -> float | None:
+        return filetime_to_unix(self.accessed_ft)
 
 
 def parse_standard_information(
@@ -316,15 +349,7 @@ def parse_standard_information(
 ) -> StandardInfo | None:
     if attr.non_resident or attr.value_length < _STD_INFO.size:
         return None
-    base = attr_offset + attr.value_offset
-    created, modified, mft_changed, accessed, attributes = _STD_INFO.unpack_from(buf, base)
-    return StandardInfo(
-        created=filetime_to_unix(created),
-        modified=filetime_to_unix(modified),
-        mft_changed=filetime_to_unix(mft_changed),
-        accessed=filetime_to_unix(accessed),
-        attributes=attributes,
-    )
+    return StandardInfo(*_STD_INFO.unpack_from(buf, attr_offset + attr.value_offset))
 
 
 @dataclass(slots=True)
@@ -335,12 +360,22 @@ class FileNameInfo:
     allocated_hint: int
     real_hint: int
     attributes: int
-    created: float | None = None
-    modified: float | None = None
+    # 同样存原始 FILETIME,见 StandardInfo 的说明。默认 0 和以前的默认 None
+    # 是同一个意思 —— filetime_to_unix(0) 返回 None。
+    created_ft: int = 0
+    modified_ft: int = 0
 
     @property
     def rank(self) -> int:
         return _NAMESPACE_RANK.get(self.namespace, -1)
+
+    @property
+    def created(self) -> float | None:
+        return filetime_to_unix(self.created_ft)
+
+    @property
+    def modified(self) -> float | None:
+        return filetime_to_unix(self.modified_ft)
 
 
 def parse_file_name(
@@ -379,8 +414,8 @@ def parse_file_name(
         allocated_hint=allocated_hint,
         real_hint=real_hint,
         attributes=attributes,
-        created=filetime_to_unix(created),
-        modified=filetime_to_unix(modified),
+        created_ft=created,
+        modified_ft=modified,
     )
 
 
